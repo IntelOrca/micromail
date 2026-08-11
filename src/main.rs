@@ -29,7 +29,7 @@ async fn run() -> Result<()> {
     let config_dir = cli.config.clone();
     let config = Config::load(&config_dir)?;
 
-    init_tracing(&config);
+    init_tracing(&config, cli.verbose);
 
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => serve(config, config_dir).await,
@@ -157,9 +157,16 @@ async fn send(args: micromail::cli::SendArgs, config: Config, config_dir: &std::
     Ok(())
 }
 
-fn init_tracing(config: &Config) {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&config.log));
+fn init_tracing(config: &Config, verbose: bool) {
+    let filter = match std::env::var("RUST_LOG") {
+        Ok(_) => tracing_subscriber::EnvFilter::from_default_env(),
+        Err(_) if verbose => tracing_subscriber::EnvFilter::new(
+            "debug,\
+             hickory_proto=warn,hickory_resolver=warn,hickory_net=warn,\
+             rustls=warn,webpki=warn,hyper=info",
+        ),
+        Err(_) => tracing_subscriber::EnvFilter::new(&config.log),
+    };
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)

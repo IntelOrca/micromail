@@ -12,6 +12,10 @@ pub struct Cli {
     #[arg(short, long, global = true, default_value = crate::config::DEFAULT_CONFIG_DIR)]
     pub config: PathBuf,
 
+    /// Verbose logging to the console
+    #[arg(short = 'v', long, global = true, action = clap::ArgAction::SetTrue)]
+    pub verbose: bool,
+
     /// Print version
     #[arg(short = 'V', long, action = clap::ArgAction::SetTrue)]
     pub version: bool,

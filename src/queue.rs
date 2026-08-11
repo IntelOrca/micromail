@@ -36,10 +36,23 @@ pub struct Spool {
 impl Spool {
     /// Create the spool directories and return the spool plus the wake-up
     /// channel receiver used by the delivery worker.
+    ///
+    /// If the spool directories cannot be created (e.g. a non-root user with
+    /// the default `/etc/micromail` config dir) the spool is still returned
+    /// and the daemon keeps running; queuing then fails per-message with a
+    /// clear error instead of aborting at startup.
     pub fn open(dir: PathBuf) -> Result<(Arc<Spool>, mpsc::Receiver<()>)> {
         let failed_dir = dir.join("failed");
-        std::fs::create_dir_all(&dir)?;
-        std::fs::create_dir_all(&failed_dir)?;
+        if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| {
+            std::fs::create_dir_all(&failed_dir)
+        }) {
+            tracing::warn!(
+                dir = %dir.display(),
+                err = %e,
+                "cannot create spool directory; queuing and delivery are unavailable. \
+                 Run with -c <writable-config-dir> or as root"
+            );
+        }
         let (tx, rx) = mpsc::channel(16);
         Ok((Arc::new(Spool { dir, failed_dir, tx }), rx))
     }

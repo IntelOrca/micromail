@@ -1,6 +1,8 @@
 use crate::config::Config;
 use crate::dkim::{DkimManager, headers_to_sign};
 use crate::error::{Error, Result};
+use mail_send::mail_auth::common::crypto::DkimKey;
+use mail_send::mail_auth::dkim::{DkimSigner, Done};
 use mail_send::smtp::message::Message;
 use mail_send::{Credentials, SmtpClient, SmtpClientBuilder};
 use std::sync::Arc;
@@ -119,12 +121,6 @@ impl Delivery {
             Error::InvalidInput(format!("invalid envelope sender address {from:?}"))
         })?;
 
-        let message = Message::new(
-            from.to_string(),
-            to.iter().cloned(),
-            body.to_vec(),
-        );
-
         let signer = if self.dkim.has_signer(&from_domain) {
             let headers = headers_to_sign(body);
             if headers.is_empty() {
@@ -136,43 +132,93 @@ impl Delivery {
         } else {
             None
         };
+        let signer = signer.as_ref();
 
-        let mut client = self.connect(&from_domain).await?;
+        if let Some(relay) = &self.relay {
+            tracing::info!(
+                relay = %relay.host,
+                port = relay.port,
+                tls = ?relay.tls,
+                "delivering via relay"
+            );
+            let message = Message::new(from.to_string(), to.iter().cloned(), body.to_vec());
+            let mut client = self
+                .connect_target(
+                    &relay.host,
+                    relay.port,
+                    relay.tls,
+                    relay.username.as_deref(),
+                    relay.password.as_deref(),
+                )
+                .await?;
+            return self.send_message(&mut client, message, signer).await;
+        }
 
-        match signer {
-            Some(signer) => {
-                client.send_signed(message, &signer).await?;
-            }
-            None => {
-                client.send(message).await?;
+        self.deliver_direct(from, to, body, signer).await
+    }
+
+    /// Deliver directly to the recipient MX servers. Recipients are grouped by
+    /// domain and each group is sent over a connection to that domain's MX.
+    async fn deliver_direct(
+        &self,
+        from: &str,
+        to: &[String],
+        body: &[u8],
+        signer: Option<&DkimSigner<DkimKey, Done>>,
+    ) -> Result<()> {
+        let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+        for rcpt in to {
+            let domain = email_domain(rcpt).ok_or_else(|| {
+                Error::InvalidInput(format!("invalid recipient address {rcpt:?}"))
+            })?;
+            match groups.iter_mut().find(|(d, _)| *d == domain) {
+                Some((_, list)) => list.push(rcpt.clone()),
+                None => groups.push((domain, vec![rcpt.clone()])),
             }
         }
 
+        for (domain, rcpts) in &groups {
+            let hosts = resolve_mx(domain).await?;
+            tracing::debug!(domain = %domain, hosts = ?hosts, "resolved MX hosts");
+
+            let mut last_err = None;
+            let mut client = None;
+            for host in &hosts {
+                match self.connect_target(host, 25, TlsMode::Auto, None, None).await {
+                    Ok(c) => {
+                        client = Some(c);
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::debug!(host = %host, err = %e, "MX connection failed; trying next");
+                        last_err = Some(e);
+                    }
+                }
+            }
+            let Some(mut client) = client else {
+                return Err(last_err.unwrap_or_else(|| {
+                    Error::Dns(format!("no reachable MX host for {domain}"))
+                }));
+            };
+
+            tracing::info!(domain = %domain, rcpts = rcpts.len(), "delivering to domain MX");
+            let message = Message::new(from.to_string(), rcpts.iter().cloned(), body.to_vec());
+            self.send_message(&mut client, message, signer).await?;
+        }
         Ok(())
     }
 
-    async fn connect(&self, domain: &str) -> Result<SmtpClient<DynStream>> {
-        if let Some(relay) = &self.relay {
-            self.connect_target(&relay.host, relay.port, relay.tls, relay.username.as_deref(), relay.password.as_deref())
-                .await
-        } else {
-            self.connect_to_mx(domain).await
+    async fn send_message<'x>(
+        &self,
+        client: &mut SmtpClient<DynStream>,
+        message: Message<'x>,
+        signer: Option<&DkimSigner<DkimKey, Done>>,
+    ) -> Result<()> {
+        match signer {
+            Some(signer) => client.send_signed(message, signer).await?,
+            None => client.send(message).await?,
         }
-    }
-
-    async fn connect_to_mx(&self, domain: &str) -> Result<SmtpClient<DynStream>> {
-        let hosts = resolve_mx(domain).await?;
-        let mut last_err = None;
-        for host in &hosts {
-            match self
-                .connect_target(host, 25, TlsMode::Auto, None, None)
-                .await
-            {
-                Ok(client) => return Ok(client),
-                Err(e) => last_err = Some(e),
-            }
-        }
-        Err(last_err.unwrap_or_else(|| Error::Dns(format!("no MX hosts for {domain}"))))
+        Ok(())
     }
 
     async fn connect_target(
@@ -183,6 +229,7 @@ impl Delivery {
         username: Option<&str>,
         password: Option<&str>,
     ) -> Result<SmtpClient<DynStream>> {
+        tracing::debug!(host = %host, port, tls = ?tls, "connecting to SMTP server");
         match tls {
             TlsMode::Plain => {
                 let client = make_builder(host, port, self.timeout, username, password)?
@@ -265,6 +312,7 @@ fn box_client<T: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static>(
 async fn resolve_mx(domain: &str) -> Result<Vec<String>> {
     use hickory_resolver::TokioResolver;
 
+    tracing::debug!(domain = %domain, "resolving MX records");
     let resolver = TokioResolver::builder_tokio()
         .map_err(|e| Error::Dns(e.to_string()))?
         .build()
