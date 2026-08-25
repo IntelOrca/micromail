@@ -3,7 +3,7 @@ use crate::error::Result;
 use crate::queue::Spool;
 use crate::send::DynStream;
 use crate::smtp_auth;
-use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,11 +44,7 @@ impl SmtpServer {
         } else {
             None
         };
-        Ok(SmtpServer {
-            config,
-            spool,
-            tls,
-        })
+        Ok(SmtpServer { config, spool, tls })
     }
 
     /// Bind the configured listeners and accept connections until the
@@ -138,7 +134,11 @@ enum AuthPhase {
     LoginPassword(String),
 }
 
-async fn accept_loop(listener: TcpListener, session: Arc<Session>, mut shutdown: watch::Receiver<bool>) {
+async fn accept_loop(
+    listener: TcpListener,
+    session: Arc<Session>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
@@ -167,7 +167,11 @@ async fn accept_loop(listener: TcpListener, session: Arc<Session>, mut shutdown:
 }
 
 async fn handle(mut stream: StreamBuf<DynStream>, session: Arc<Session>) -> Result<()> {
-    write_reply(&mut stream.inner, &format!("220 {} ESMTP micromail\r\n", session.hostname)).await?;
+    write_reply(
+        &mut stream.inner,
+        &format!("220 {} ESMTP micromail\r\n", session.hostname),
+    )
+    .await?;
 
     let mut state = ConnState::default();
 
@@ -189,48 +193,65 @@ async fn handle(mut stream: StreamBuf<DynStream>, session: Arc<Session>) -> Resu
         // AUTH continuation phase.
         if let Some(phase) = state.auth_phase.take() {
             match phase {
-                AuthPhase::PlainChallenge => {
-                    match smtp_auth::decode_plain(text) {
-                        Ok((user, pass)) => {
-                            if smtp_auth::authenticate(&session.users, &user, &pass) {
-                                finish_auth(&mut state, user);
-                                write_reply(&mut stream.inner, "235 2.7.0 Authentication successful\r\n").await?;
-                            } else {
-                                write_reply(&mut stream.inner, "535 5.7.8 Authentication credentials invalid\r\n").await?;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("AUTH PLAIN error: {e}");
-                            write_reply(&mut stream.inner, "501 5.5.4 Invalid AUTH response\r\n").await?;
-                        }
-                    }
-                }
-                AuthPhase::LoginUsername => {
-                    match smtp_auth::decode_b64(text) {
-                        Ok(user) => {
-                            state.auth_phase = Some(AuthPhase::LoginPassword(user));
-                            write_reply(&mut stream.inner, &format!("334 {}\r\n", smtp_auth::encode_challenge("Password:"))).await?;
-                        }
-                        Err(_) => {
-                            write_reply(&mut stream.inner, "501 5.5.4 Invalid AUTH response\r\n").await?;
+                AuthPhase::PlainChallenge => match smtp_auth::decode_plain(text) {
+                    Ok((user, pass)) => {
+                        if smtp_auth::authenticate(&session.users, &user, &pass) {
+                            finish_auth(&mut state, user);
+                            write_reply(
+                                &mut stream.inner,
+                                "235 2.7.0 Authentication successful\r\n",
+                            )
+                            .await?;
+                        } else {
+                            write_reply(
+                                &mut stream.inner,
+                                "535 5.7.8 Authentication credentials invalid\r\n",
+                            )
+                            .await?;
                         }
                     }
-                }
-                AuthPhase::LoginPassword(user) => {
-                    match smtp_auth::decode_b64(text) {
-                        Ok(pass) => {
-                            if smtp_auth::authenticate(&session.users, &user, &pass) {
-                                finish_auth(&mut state, user);
-                                write_reply(&mut stream.inner, "235 2.7.0 Authentication successful\r\n").await?;
-                            } else {
-                                write_reply(&mut stream.inner, "535 5.7.8 Authentication credentials invalid\r\n").await?;
-                            }
-                        }
-                        Err(_) => {
-                            write_reply(&mut stream.inner, "501 5.5.4 Invalid AUTH response\r\n").await?;
+                    Err(e) => {
+                        tracing::warn!("AUTH PLAIN error: {e}");
+                        write_reply(&mut stream.inner, "501 5.5.4 Invalid AUTH response\r\n")
+                            .await?;
+                    }
+                },
+                AuthPhase::LoginUsername => match smtp_auth::decode_b64(text) {
+                    Ok(user) => {
+                        state.auth_phase = Some(AuthPhase::LoginPassword(user));
+                        write_reply(
+                            &mut stream.inner,
+                            &format!("334 {}\r\n", smtp_auth::encode_challenge("Password:")),
+                        )
+                        .await?;
+                    }
+                    Err(_) => {
+                        write_reply(&mut stream.inner, "501 5.5.4 Invalid AUTH response\r\n")
+                            .await?;
+                    }
+                },
+                AuthPhase::LoginPassword(user) => match smtp_auth::decode_b64(text) {
+                    Ok(pass) => {
+                        if smtp_auth::authenticate(&session.users, &user, &pass) {
+                            finish_auth(&mut state, user);
+                            write_reply(
+                                &mut stream.inner,
+                                "235 2.7.0 Authentication successful\r\n",
+                            )
+                            .await?;
+                        } else {
+                            write_reply(
+                                &mut stream.inner,
+                                "535 5.7.8 Authentication credentials invalid\r\n",
+                            )
+                            .await?;
                         }
                     }
-                }
+                    Err(_) => {
+                        write_reply(&mut stream.inner, "501 5.5.4 Invalid AUTH response\r\n")
+                            .await?;
+                    }
+                },
             }
             continue;
         }
@@ -252,7 +273,8 @@ async fn handle(mut stream: StreamBuf<DynStream>, session: Arc<Session>) -> Resu
             }
             "AUTH" => {
                 if !state.ehlo {
-                    write_reply(&mut stream.inner, "503 5.5.1 Bad sequence of commands\r\n").await?;
+                    write_reply(&mut stream.inner, "503 5.5.1 Bad sequence of commands\r\n")
+                        .await?;
                     continue;
                 }
                 if session.users.is_empty() {
@@ -276,13 +298,25 @@ async fn handle(mut stream: StreamBuf<DynStream>, session: Arc<Session>) -> Resu
                                 Ok((user, pass)) => {
                                     if smtp_auth::authenticate(&session.users, &user, &pass) {
                                         finish_auth(&mut state, user);
-                                        write_reply(&mut stream.inner, "235 2.7.0 Authentication successful\r\n").await?;
+                                        write_reply(
+                                            &mut stream.inner,
+                                            "235 2.7.0 Authentication successful\r\n",
+                                        )
+                                        .await?;
                                     } else {
-                                        write_reply(&mut stream.inner, "535 5.7.8 Authentication credentials invalid\r\n").await?;
+                                        write_reply(
+                                            &mut stream.inner,
+                                            "535 5.7.8 Authentication credentials invalid\r\n",
+                                        )
+                                        .await?;
                                     }
                                 }
                                 Err(_) => {
-                                    write_reply(&mut stream.inner, "501 5.5.4 Invalid AUTH response\r\n").await?;
+                                    write_reply(
+                                        &mut stream.inner,
+                                        "501 5.5.4 Invalid AUTH response\r\n",
+                                    )
+                                    .await?;
                                 }
                             }
                         } else {
@@ -296,19 +330,38 @@ async fn handle(mut stream: StreamBuf<DynStream>, session: Arc<Session>) -> Resu
                             match smtp_auth::decode_b64(&token) {
                                 Ok(user) => {
                                     state.auth_phase = Some(AuthPhase::LoginPassword(user));
-                                    write_reply(&mut stream.inner, &format!("334 {}\r\n", smtp_auth::encode_challenge("Password:"))).await?;
+                                    write_reply(
+                                        &mut stream.inner,
+                                        &format!(
+                                            "334 {}\r\n",
+                                            smtp_auth::encode_challenge("Password:")
+                                        ),
+                                    )
+                                    .await?;
                                 }
                                 Err(_) => {
-                                    write_reply(&mut stream.inner, "501 5.5.4 Invalid AUTH response\r\n").await?;
+                                    write_reply(
+                                        &mut stream.inner,
+                                        "501 5.5.4 Invalid AUTH response\r\n",
+                                    )
+                                    .await?;
                                 }
                             }
                         } else {
                             state.auth_phase = Some(AuthPhase::LoginUsername);
-                            write_reply(&mut stream.inner, &format!("334 {}\r\n", smtp_auth::encode_challenge("Username:"))).await?;
+                            write_reply(
+                                &mut stream.inner,
+                                &format!("334 {}\r\n", smtp_auth::encode_challenge("Username:")),
+                            )
+                            .await?;
                         }
                     }
                     _ => {
-                        write_reply(&mut stream.inner, "504 5.5.4 Unsupported authentication mechanism\r\n").await?;
+                        write_reply(
+                            &mut stream.inner,
+                            "504 5.5.4 Unsupported authentication mechanism\r\n",
+                        )
+                        .await?;
                     }
                 }
             }
@@ -346,7 +399,8 @@ async fn handle(mut stream: StreamBuf<DynStream>, session: Arc<Session>) -> Resu
                 }
                 let addr = parse_path_address(arg);
                 let Some(addr) = addr.filter(|a| !a.is_empty()) else {
-                    write_reply(&mut stream.inner, "501 5.5.4 Invalid MAIL FROM address\r\n").await?;
+                    write_reply(&mut stream.inner, "501 5.5.4 Invalid MAIL FROM address\r\n")
+                        .await?;
                     continue;
                 };
                 state.rcpt_to.clear();
@@ -378,29 +432,48 @@ async fn handle(mut stream: StreamBuf<DynStream>, session: Arc<Session>) -> Resu
                     continue;
                 }
                 if state.mail_from.is_none() || state.rcpt_to.is_empty() {
-                    write_reply(&mut stream.inner, "503 5.5.1 Need MAIL and RCPT before DATA\r\n").await?;
+                    write_reply(
+                        &mut stream.inner,
+                        "503 5.5.1 Need MAIL and RCPT before DATA\r\n",
+                    )
+                    .await?;
                     continue;
                 }
                 write_reply(&mut stream.inner, "354 End data with <CR><LF>.<CR><LF>\r\n").await?;
                 stream.inner.flush().await?;
 
-                let body = match timeout(DATA_TIMEOUT, stream.read_data(session.max_message_size)).await {
+                let body = match timeout(DATA_TIMEOUT, stream.read_data(session.max_message_size))
+                    .await
+                {
                     Ok(Ok(Some(body))) => body,
                     Ok(Ok(None)) => {
-                        write_reply(&mut stream.inner, "451 4.4.1 Connection lost while reading message\r\n").await?;
+                        write_reply(
+                            &mut stream.inner,
+                            "451 4.4.1 Connection lost while reading message\r\n",
+                        )
+                        .await?;
                         continue;
                     }
                     Ok(Err(e)) => {
                         let too_large = e.kind() == std::io::ErrorKind::InvalidData;
                         if too_large {
-                            write_reply(&mut stream.inner, "552 5.3.4 Message size exceeds limit\r\n").await?;
+                            write_reply(
+                                &mut stream.inner,
+                                "552 5.3.4 Message size exceeds limit\r\n",
+                            )
+                            .await?;
                         } else {
-                            write_reply(&mut stream.inner, "451 4.3.0 Error reading message\r\n").await?;
+                            write_reply(&mut stream.inner, "451 4.3.0 Error reading message\r\n")
+                                .await?;
                         }
                         continue;
                     }
                     Err(_) => {
-                        write_reply(&mut stream.inner, "451 4.4.2 Timeout while reading message\r\n").await?;
+                        write_reply(
+                            &mut stream.inner,
+                            "451 4.4.2 Timeout while reading message\r\n",
+                        )
+                        .await?;
                         continue;
                     }
                 };
@@ -410,13 +483,18 @@ async fn handle(mut stream: StreamBuf<DynStream>, session: Arc<Session>) -> Resu
                 match session.spool.enqueue(mail_from, rcpt_to, body).await {
                     Ok(id) => {
                         tracing::info!(id = %id, "message accepted from SMTP");
-                        write_reply(&mut stream.inner, &format!("250 2.0.0 Ok: queued as {id}\r\n")).await?;
+                        write_reply(
+                            &mut stream.inner,
+                            &format!("250 2.0.0 Ok: queued as {id}\r\n"),
+                        )
+                        .await?;
                         state.mail_from = None;
                         state.rcpt_to.clear();
                     }
                     Err(e) => {
                         tracing::error!("failed to spool SMTP message: {e}");
-                        write_reply(&mut stream.inner, "451 4.3.0 Temporary local error\r\n").await?;
+                        write_reply(&mut stream.inner, "451 4.3.0 Temporary local error\r\n")
+                            .await?;
                     }
                 }
             }
@@ -438,7 +516,11 @@ async fn handle(mut stream: StreamBuf<DynStream>, session: Arc<Session>) -> Resu
                 write_reply(&mut stream.inner, "252 2.5.2 Cannot VRFY user\r\n").await?;
             }
             "HELP" => {
-                write_reply(&mut stream.inner, "214 2.0.0 Commands: EHLO HELO AUTH MAIL RCPT DATA RSET NOOP QUIT\r\n").await?;
+                write_reply(
+                    &mut stream.inner,
+                    "214 2.0.0 Commands: EHLO HELO AUTH MAIL RCPT DATA RSET NOOP QUIT\r\n",
+                )
+                .await?;
             }
             _ => {
                 write_reply(&mut stream.inner, "500 5.5.2 Unrecognized command\r\n").await?;
@@ -743,7 +825,12 @@ mod tests {
             (line, data)
         });
 
-        client.write_all(b"EHLO example.com\r\nFrom: a@b.com\r\nTo: c@d.com\r\n\r\n..stuffed\r\n.\r\n").await.unwrap();
+        client
+            .write_all(
+                b"EHLO example.com\r\nFrom: a@b.com\r\nTo: c@d.com\r\n\r\n..stuffed\r\n.\r\n",
+            )
+            .await
+            .unwrap();
         client.shutdown().await.unwrap();
 
         let (line, data) = handle.await.unwrap();

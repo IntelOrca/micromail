@@ -1,5 +1,5 @@
 use crate::config::SmtpUser;
-use base64::{Engine, engine::general_purpose::STANDARD};
+use base64::{engine::general_purpose::STANDARD, Engine};
 
 /// Decode an AUTH PLAIN initial response of the form
 /// `<authzid>\0<authcid>\0<password>`.
@@ -38,10 +38,10 @@ pub fn encode_challenge(label: &str) -> String {
 
 /// Check credentials against the configured users.
 pub fn authenticate(users: &[SmtpUser], username: &str, password: &str) -> bool {
-    users
-        .iter()
-        .any(|u| constant_time_eq(u.username.as_bytes(), username.as_bytes())
-            && constant_time_eq(u.password.as_bytes(), password.as_bytes()))
+    users.iter().any(|u| {
+        constant_time_eq(u.username.as_bytes(), username.as_bytes())
+            && constant_time_eq(u.password.as_bytes(), password.as_bytes())
+    })
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -58,7 +58,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::{Engine, engine::general_purpose::STANDARD};
+    use base64::{engine::general_purpose::STANDARD, Engine};
 
     fn plain(user: &str, pass: &str) -> String {
         STANDARD.encode(format!("\0{user}\0{pass}"))

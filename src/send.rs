@@ -1,8 +1,6 @@
 use crate::config::Config;
-use crate::dkim::{DkimManager, headers_to_sign};
+use crate::dkim::{headers_to_sign, DkimManager, DkimSigner};
 use crate::error::{Error, Result};
-use mail_send::mail_auth::common::crypto::DkimKey;
-use mail_send::mail_auth::dkim::{DkimSigner, Done};
 use mail_send::smtp::message::Message;
 use mail_send::{Credentials, SmtpClient, SmtpClientBuilder};
 use std::sync::Arc;
@@ -56,12 +54,22 @@ impl Delivery {
     pub fn from_config(config: &Config, config_dir: &std::path::Path) -> Result<Self> {
         let dkim = if config.dkim.enabled {
             let user_dkim = config.dkim_dir(config_dir);
-            let system_dkim = std::path::PathBuf::from(crate::config::SYSTEM_CONFIG_DIR).join("dkim");
+            let system_dkim =
+                std::path::PathBuf::from(crate::config::SYSTEM_CONFIG_DIR).join("dkim");
             let default_user = crate::config::default_config_dir();
-            let dkim = if config_dir == default_user && config_dir != std::path::Path::new(crate::config::SYSTEM_CONFIG_DIR) {
-                Arc::new(DkimManager::load_merged(&system_dkim, &user_dkim, &config.dkim_selector_default)?)
+            let dkim = if config_dir == default_user
+                && config_dir != std::path::Path::new(crate::config::SYSTEM_CONFIG_DIR)
+            {
+                Arc::new(DkimManager::load_merged(
+                    &system_dkim,
+                    &user_dkim,
+                    &config.dkim_selector_default,
+                )?)
             } else {
-                Arc::new(DkimManager::load(&user_dkim, &config.dkim_selector_default)?)
+                Arc::new(DkimManager::load(
+                    &user_dkim,
+                    &config.dkim_selector_default,
+                )?)
             };
             dkim
         } else {
@@ -149,7 +157,8 @@ impl Delivery {
                 tls = ?relay.tls,
                 "delivering via relay"
             );
-            let message = Message::new(from.to_string(), to.iter().cloned(), body.to_vec());
+            let message_body = sign_message_if_needed(body, signer)?;
+            let message = Message::new(from.to_string(), to.iter().cloned(), message_body);
             let mut client = self
                 .connect_target(
                     &relay.host,
@@ -159,7 +168,7 @@ impl Delivery {
                     relay.password.as_deref(),
                 )
                 .await?;
-            return self.send_message(&mut client, message, signer).await;
+            return self.send_message(&mut client, message).await;
         }
 
         self.deliver_direct(from, to, body, signer).await
@@ -172,7 +181,7 @@ impl Delivery {
         from: &str,
         to: &[String],
         body: &[u8],
-        signer: Option<&DkimSigner<DkimKey, Done>>,
+        signer: Option<&DkimSigner>,
     ) -> Result<()> {
         let mut groups: Vec<(String, Vec<String>)> = Vec::new();
         for rcpt in to {
@@ -192,7 +201,10 @@ impl Delivery {
             let mut last_err = None;
             let mut client = None;
             for host in &hosts {
-                match self.connect_target(host, 25, TlsMode::Auto, None, None).await {
+                match self
+                    .connect_target(host, 25, TlsMode::Auto, None, None)
+                    .await
+                {
                     Ok(c) => {
                         client = Some(c);
                         break;
@@ -204,14 +216,14 @@ impl Delivery {
                 }
             }
             let Some(mut client) = client else {
-                return Err(last_err.unwrap_or_else(|| {
-                    Error::Dns(format!("no reachable MX host for {domain}"))
-                }));
+                return Err(last_err
+                    .unwrap_or_else(|| Error::Dns(format!("no reachable MX host for {domain}"))));
             };
 
             tracing::info!(domain = %domain, rcpts = rcpts.len(), "delivering to domain MX");
-            let message = Message::new(from.to_string(), rcpts.iter().cloned(), body.to_vec());
-            self.send_message(&mut client, message, signer).await?;
+            let message_body = sign_message_if_needed(body, signer)?;
+            let message = Message::new(from.to_string(), rcpts.iter().cloned(), message_body);
+            self.send_message(&mut client, message).await?;
         }
         Ok(())
     }
@@ -220,12 +232,8 @@ impl Delivery {
         &self,
         client: &mut SmtpClient<DynStream>,
         message: Message<'x>,
-        signer: Option<&DkimSigner<DkimKey, Done>>,
     ) -> Result<()> {
-        match signer {
-            Some(signer) => client.send_signed(message, signer).await?,
-            None => client.send(message).await?,
-        }
+        client.send(message).await?;
         Ok(())
     }
 
@@ -274,9 +282,10 @@ impl Delivery {
                     {
                         Ok(client) => Ok(box_client(client)),
                         Err(mail_send::Error::MissingStartTls) => {
-                            let client = make_builder(host, port, self.timeout, username, password)?
-                                .connect_plain()
-                                .await?;
+                            let client =
+                                make_builder(host, port, self.timeout, username, password)?
+                                    .connect_plain()
+                                    .await?;
                             Ok(box_client(client))
                         }
                         Err(e) => Err(e.into()),
@@ -284,6 +293,42 @@ impl Delivery {
                 }
             }
         }
+    }
+}
+
+fn sign_message_if_needed(body: &[u8], signer: Option<&DkimSigner>) -> Result<Vec<u8>> {
+    if let Some(signer) = signer {
+        let dkim_header = signer.sign(body)?;
+        Ok(insert_dkim_header(body, &dkim_header))
+    } else {
+        Ok(body.to_vec())
+    }
+}
+
+fn insert_dkim_header(original: &[u8], dkim_header: &str) -> Vec<u8> {
+    let header_bytes = dkim_header.as_bytes();
+    // Find header/body split
+    if let Some(pos) = original.windows(4).position(|w| w == b"\r\n\r\n") {
+        let mut out = Vec::with_capacity(original.len() + header_bytes.len() + 2);
+        out.extend_from_slice(&original[..pos]);
+        out.extend_from_slice(b"\r\n");
+        out.extend_from_slice(header_bytes);
+        out.extend_from_slice(&original[pos..]);
+        out
+    } else if let Some(pos) = original.windows(2).position(|w| w == b"\n\n") {
+        let mut out = Vec::with_capacity(original.len() + header_bytes.len() + 2);
+        out.extend_from_slice(&original[..pos]);
+        out.extend_from_slice(b"\n");
+        out.extend_from_slice(header_bytes);
+        out.extend_from_slice(&original[pos..]);
+        out
+    } else {
+        // No body, just append
+        let mut out = Vec::with_capacity(original.len() + header_bytes.len() + 2);
+        out.extend_from_slice(header_bytes);
+        out.extend_from_slice(b"\r\n");
+        out.extend_from_slice(original);
+        out
     }
 }
 
@@ -347,7 +392,9 @@ async fn resolve_mx(domain: &str) -> Result<Vec<String>> {
             if hosts.is_empty() {
                 // No usable MX (including Null MX 0 .): do not fall back to A
                 // per RFC 7505 — fail rather than delivering to the apex A record.
-                return Err(Error::Dns(format!("domain {domain} has no mail exchanger (null MX)")));
+                return Err(Error::Dns(format!(
+                    "domain {domain} has no mail exchanger (null MX)"
+                )));
             }
             hosts.sort_by_key(|(pref, _)| *pref);
             Ok(hosts.into_iter().map(|(_, host)| host).collect())
@@ -429,5 +476,20 @@ mod tests {
         assert_eq!(TlsMode::from_str("auto").unwrap(), TlsMode::Auto);
         assert_eq!(TlsMode::from_str("STARTTLS").unwrap(), TlsMode::Starttls);
         assert!(TlsMode::from_str("bogus").is_err());
+    }
+
+    #[test]
+    fn inserts_dkim_header() {
+        let msg = b"From: a@example.com\r\nTo: b@example.com\r\nSubject: Hi\r\n\r\nbody\r\n";
+        let dkim = "DKIM-Signature: v=1; a=rsa-sha256; d=example.com; s=test; bh=abc; b=def";
+        let out = insert_dkim_header(msg, dkim);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("DKIM-Signature:"));
+        assert!(s.contains("From: a@example.com"));
+        // DKIM should be between existing headers and body
+        let dkim_pos = s.find("DKIM-Signature:").unwrap();
+        let from_pos = s.find("From:").unwrap();
+        let body_pos = s.find("\r\n\r\n").unwrap();
+        assert!(dkim_pos > from_pos && dkim_pos < body_pos);
     }
 }

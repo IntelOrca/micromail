@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::queue::Spool;
 use axum::extract::State;
-use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use axum::http::{header::AUTHORIZATION, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -85,7 +85,11 @@ async fn health() -> impl IntoResponse {
     (StatusCode::OK, Json(json!({ "status": "ok" })))
 }
 
-async fn auth(State(state): State<AppState>, req: Request<axum::body::Body>, next: Next) -> Response {
+async fn auth(
+    State(state): State<AppState>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
     let authorized = req
         .headers()
         .get(AUTHORIZATION)
@@ -136,7 +140,9 @@ async fn build_and_enqueue(state: &AppState, req: &SendRequest) -> Result<String
     let mut recipients = Vec::new();
     for addr in req.to.iter().chain(req.cc.iter()).chain(req.bcc.iter()) {
         if !crate::message::is_valid_email(addr) {
-            return Err(Error::InvalidInput(format!("invalid recipient address {addr:?}")));
+            return Err(Error::InvalidInput(format!(
+                "invalid recipient address {addr:?}"
+            )));
         }
         recipients.push(addr.trim().to_lowercase());
     }
@@ -153,7 +159,10 @@ async fn build_and_enqueue(state: &AppState, req: &SendRequest) -> Result<String
         )));
     }
     if !crate::message::is_valid_email(&req.from) {
-        return Err(Error::InvalidInput(format!("invalid from address {:?}", req.from)));
+        return Err(Error::InvalidInput(format!(
+            "invalid from address {:?}",
+            req.from
+        )));
     }
 
     let outgoing = crate::message::Outgoing {

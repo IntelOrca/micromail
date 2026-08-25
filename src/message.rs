@@ -57,10 +57,7 @@ pub fn is_valid_email(addr: &str) -> bool {
     }
     let local = &addr[..at];
     let domain = &addr[at + 1..];
-    !local.is_empty()
-        && !domain.is_empty()
-        && !domain.starts_with('.')
-        && !domain.ends_with('.')
+    !local.is_empty() && !domain.is_empty() && !domain.starts_with('.') && !domain.ends_with('.')
 }
 
 #[cfg(test)]

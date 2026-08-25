@@ -43,9 +43,9 @@ impl Spool {
     /// clear error instead of aborting at startup.
     pub fn open(dir: PathBuf) -> Result<(Arc<Spool>, mpsc::Receiver<()>)> {
         let failed_dir = dir.join("failed");
-        if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| {
-            std::fs::create_dir_all(&failed_dir)
-        }) {
+        if let Err(e) =
+            std::fs::create_dir_all(&dir).and_then(|()| std::fs::create_dir_all(&failed_dir))
+        {
             tracing::warn!(
                 dir = %dir.display(),
                 err = %e,
@@ -54,7 +54,14 @@ impl Spool {
             );
         }
         let (tx, rx) = mpsc::channel(16);
-        Ok((Arc::new(Spool { dir, failed_dir, tx }), rx))
+        Ok((
+            Arc::new(Spool {
+                dir,
+                failed_dir,
+                tx,
+            }),
+            rx,
+        ))
     }
 
     pub fn dir(&self) -> &PathBuf {
@@ -253,7 +260,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (spool, _rx) = Spool::open(dir.path().join("spool")).unwrap();
         let id = spool
-            .enqueue("a@example.com".into(), vec!["b@example.com".into()], b"From: a\r\n\r\nhi".to_vec())
+            .enqueue(
+                "a@example.com".into(),
+                vec!["b@example.com".into()],
+                b"From: a\r\n\r\nhi".to_vec(),
+            )
             .await
             .unwrap();
         let msg_dir = spool.dir().join(&id);
@@ -269,7 +280,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (spool, _rx) = Spool::open(dir.path().join("spool")).unwrap();
         let id = spool
-            .enqueue("a@example.com".into(), vec!["b@example.com".into()], b"hi".to_vec())
+            .enqueue(
+                "a@example.com".into(),
+                vec!["b@example.com".into()],
+                b"hi".to_vec(),
+            )
             .await
             .unwrap();
         let msg_dir = spool.dir().join(&id);
@@ -280,8 +295,8 @@ mod tests {
 
         // delivery is a stub that errors, so message should still exist and
         // attempts should have advanced.
-        let meta: Meta = toml::from_str(&std::fs::read_to_string(msg_dir.join("meta.toml")).unwrap())
-            .unwrap();
+        let meta: Meta =
+            toml::from_str(&std::fs::read_to_string(msg_dir.join("meta.toml")).unwrap()).unwrap();
         assert_eq!(meta.attempts, 1);
     }
 

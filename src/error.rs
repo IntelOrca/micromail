@@ -44,10 +44,4 @@ impl From<mail_send::Error> for Error {
     }
 }
 
-impl From<mail_send::mail_auth::Error> for Error {
-    fn from(e: mail_send::mail_auth::Error) -> Self {
-        Error::Dkim(e.to_string())
-    }
-}
-
 pub type Result<T> = std::result::Result<T, Error>;

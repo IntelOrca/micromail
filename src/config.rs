@@ -198,7 +198,12 @@ impl Config {
             Ok(bytes) => toml::from_slice(&bytes)
                 .map_err(|e| Error::Config(format!("invalid {}: {e}", path.display())))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
-            Err(e) => return Err(Error::Config(format!("cannot read {}: {e}", path.display()))),
+            Err(e) => {
+                return Err(Error::Config(format!(
+                    "cannot read {}: {e}",
+                    path.display()
+                )))
+            }
         };
         config.resolve_paths(dir);
         Ok(config)
@@ -206,17 +211,34 @@ impl Config {
 
     fn load_merged(system_dir: &Path, user_dir: &Path) -> Result<Config> {
         let mut base_table: toml::Table = match std::fs::read(system_dir.join("config.toml")) {
-            Ok(bytes) => toml::from_slice(&bytes)
-                .map_err(|e| Error::Config(format!("invalid {}: {e}", system_dir.join("config.toml").display())))?,
+            Ok(bytes) => toml::from_slice(&bytes).map_err(|e| {
+                Error::Config(format!(
+                    "invalid {}: {e}",
+                    system_dir.join("config.toml").display()
+                ))
+            })?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
-            Err(e) => return Err(Error::Config(format!("cannot read {}: {e}", system_dir.join("config.toml").display()))),
+            Err(e) => {
+                return Err(Error::Config(format!(
+                    "cannot read {}: {e}",
+                    system_dir.join("config.toml").display()
+                )))
+            }
         };
         let overlay_table: Option<toml::Table> = match std::fs::read(user_dir.join("config.toml")) {
             Ok(bytes) => Some(toml::from_slice(&bytes).map_err(|e| {
-                Error::Config(format!("invalid {}: {e}", user_dir.join("config.toml").display()))
+                Error::Config(format!(
+                    "invalid {}: {e}",
+                    user_dir.join("config.toml").display()
+                ))
             })?),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(Error::Config(format!("cannot read {}: {e}", user_dir.join("config.toml").display()))),
+            Err(e) => {
+                return Err(Error::Config(format!(
+                    "cannot read {}: {e}",
+                    user_dir.join("config.toml").display()
+                )))
+            }
         };
 
         let mut config = if base_table.is_empty() && overlay_table.is_none() {
@@ -227,10 +249,12 @@ impl Config {
                 .try_into()
                 .map_err(|e| Error::Config(format!("invalid merged config: {e}")))?
         } else {
-            base_table
-                .try_into()
-                .map_err(|e| Error::Config(format!("invalid {}: {e}", system_dir.join("config.toml").display())))?
-
+            base_table.try_into().map_err(|e| {
+                Error::Config(format!(
+                    "invalid {}: {e}",
+                    system_dir.join("config.toml").display()
+                ))
+            })?
         };
 
         config.resolve_paths_merged(user_dir, system_dir);
@@ -380,7 +404,10 @@ backoff_factor = 3
         assert_eq!(config.smtp.users.len(), 1);
         assert_eq!(config.smtp.users[0].username, "app");
         assert!(config.api.enabled);
-        assert_eq!(config.api.tokens, vec!["tok-1".to_string(), "tok-2".to_string()]);
+        assert_eq!(
+            config.api.tokens,
+            vec!["tok-1".to_string(), "tok-2".to_string()]
+        );
         assert_eq!(
             config.delivery.relay.as_deref(),
             Some("smtp.provider.com:587")
@@ -403,7 +430,11 @@ backoff_factor = 3
     fn merges_system_and_user_configs() {
         let sys = tempfile::tempdir().unwrap();
         let usr = tempfile::tempdir().unwrap();
-        std::fs::write(sys.path().join("config.toml"), r#"hostname = "system.example.com""#).unwrap();
+        std::fs::write(
+            sys.path().join("config.toml"),
+            r#"hostname = "system.example.com""#,
+        )
+        .unwrap();
         std::fs::write(usr.path().join("config.toml"), r#"log = "debug""#).unwrap();
         let cfg = Config::load_merged(sys.path(), usr.path()).unwrap();
         assert_eq!(cfg.hostname, "system.example.com");
@@ -414,9 +445,17 @@ backoff_factor = 3
     fn user_overrides_system() {
         let sys = tempfile::tempdir().unwrap();
         let usr = tempfile::tempdir().unwrap();
-        std::fs::write(sys.path().join("config.toml"), r#"hostname = "system.example.com"
-log = "info""#).unwrap();
-        std::fs::write(usr.path().join("config.toml"), r#"hostname = "user.example.com""#).unwrap();
+        std::fs::write(
+            sys.path().join("config.toml"),
+            r#"hostname = "system.example.com"
+log = "info""#,
+        )
+        .unwrap();
+        std::fs::write(
+            usr.path().join("config.toml"),
+            r#"hostname = "user.example.com""#,
+        )
+        .unwrap();
         let cfg = Config::load_merged(sys.path(), usr.path()).unwrap();
         assert_eq!(cfg.hostname, "user.example.com");
         assert_eq!(cfg.log, "info");

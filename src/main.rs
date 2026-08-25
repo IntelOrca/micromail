@@ -70,7 +70,11 @@ async fn serve(config: Config, config_dir: PathBuf) -> Result<()> {
     let smtp_task = tokio::spawn(smtp_server.run(shutdown_rx.clone()));
 
     let api_task = if config.api.enabled {
-        Some(tokio::spawn(api::run(config.clone(), spool.clone(), shutdown_rx.clone())))
+        Some(tokio::spawn(api::run(
+            config.clone(),
+            spool.clone(),
+            shutdown_rx.clone(),
+        )))
     } else {
         None
     };
@@ -89,26 +93,24 @@ async fn serve(config: Config, config_dir: PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn send(args: micromail::cli::SendArgs, config: Config, config_dir: &std::path::Path) -> Result<()> {
+async fn send(
+    args: micromail::cli::SendArgs,
+    config: Config,
+    config_dir: &std::path::Path,
+) -> Result<()> {
     let delivery = Delivery::from_config(&config, config_dir)?;
 
     let text = match (args.text, args.text_file) {
         (Some(t), _) => Some(t),
         (None, Some(path)) => Some(std::fs::read_to_string(&path).map_err(|e| {
-            micromail::error::Error::InvalidInput(format!(
-                "cannot read {}: {e}",
-                path.display()
-            ))
+            micromail::error::Error::InvalidInput(format!("cannot read {}: {e}", path.display()))
         })?),
         (None, None) => None,
     };
     let html = match (args.html, args.html_file) {
         (Some(h), _) => Some(h),
         (None, Some(path)) => Some(std::fs::read_to_string(&path).map_err(|e| {
-            micromail::error::Error::InvalidInput(format!(
-                "cannot read {}: {e}",
-                path.display()
-            ))
+            micromail::error::Error::InvalidInput(format!("cannot read {}: {e}", path.display()))
         })?),
         (None, None) => None,
     };
@@ -156,7 +158,11 @@ async fn send(args: micromail::cli::SendArgs, config: Config, config_dir: &std::
     let from = args.from.trim().to_lowercase();
 
     delivery.deliver(&from, &recipients, &body).await?;
-    println!("Message sent from {} to {} recipient(s)", from, recipients.len());
+    println!(
+        "Message sent from {} to {} recipient(s)",
+        from,
+        recipients.len()
+    );
     Ok(())
 }
 

@@ -1,7 +1,13 @@
 use crate::error::{Error, Result};
-use mail_send::mail_auth::common::crypto::{DkimKey, Ed25519Key, RsaKey, Sha256};
-use mail_send::mail_auth::dkim::{DkimSigner, Done};
-use rustls_pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use ed25519_dalek::pkcs8::DecodePrivateKey as EdDecodePrivateKey;
+use ed25519_dalek::Signer as _;
+use rsa::pkcs1::DecodeRsaPrivateKey;
+use rsa::pkcs8::DecodePrivateKey as RsaDecodePrivateKey;
+use rsa::{Pkcs1v15Sign, RsaPrivateKey};
+use rustls_pki_types::{pem::PemObject, PrivateKeyDer};
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -19,10 +25,25 @@ pub const DKIM_HEADERS: &[&str] = &[
     "Content-Transfer-Encoding",
 ];
 
+#[derive(Debug)]
+pub enum PrivateKey {
+    Rsa(RsaPrivateKey),
+    Ed25519(ed25519_dalek::SigningKey),
+}
+
+impl PrivateKey {
+    pub fn is_rsa(&self) -> bool {
+        matches!(self, PrivateKey::Rsa(_))
+    }
+    pub fn is_ed25519(&self) -> bool {
+        matches!(self, PrivateKey::Ed25519(_))
+    }
+}
+
 pub struct DkimEntry {
     pub domain: String,
     pub selector: String,
-    key_pem: Vec<u8>,
+    pub key: PrivateKey,
 }
 
 /// Holds the DKIM keys discovered under `<config dir>/dkim/<domain>/<selector>`.
@@ -31,6 +52,453 @@ pub struct DkimEntry {
 pub struct DkimManager {
     entries: HashMap<String, HashMap<String, DkimEntry>>,
     default_selector: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DkimAlgorithm {
+    RsaSha256,
+    RsaSha1,
+    Ed25519Sha256,
+}
+
+impl DkimAlgorithm {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DkimAlgorithm::RsaSha256 => "rsa-sha256",
+            DkimAlgorithm::RsaSha1 => "rsa-sha1",
+            DkimAlgorithm::Ed25519Sha256 => "ed25519-sha256",
+        }
+    }
+}
+
+pub struct DkimSigner {
+    pub domain: String,
+    pub selector: String,
+    pub headers: Vec<String>,
+    key: PrivateKey,
+    algorithm: DkimAlgorithm,
+}
+
+impl DkimSigner {
+    pub fn algorithm(&self) -> DkimAlgorithm {
+        self.algorithm
+    }
+
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
+
+    pub fn selector(&self) -> &str {
+        &self.selector
+    }
+
+    /// Sign `message` and return the full `DKIM-Signature:` header line (without trailing CRLF).
+    pub fn sign(&self, message: &[u8]) -> Result<String> {
+        self.sign_with_algorithm(message, self.algorithm)
+    }
+
+    pub fn sign_with_algorithm(&self, message: &[u8], algo: DkimAlgorithm) -> Result<String> {
+        // Validate algorithm matches key type
+        match (&self.key, algo) {
+            (PrivateKey::Rsa(_), DkimAlgorithm::Ed25519Sha256) => {
+                return Err(Error::Dkim("Ed25519 algorithm requires Ed25519 key".into()))
+            }
+            (PrivateKey::Ed25519(_), DkimAlgorithm::RsaSha256)
+            | (PrivateKey::Ed25519(_), DkimAlgorithm::RsaSha1) => {
+                return Err(Error::Dkim("RSA algorithm requires RSA key".into()))
+            }
+            _ => {}
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.sign_with_time(message, algo, now)
+    }
+
+    pub fn sign_with_time(&self, message: &[u8], algo: DkimAlgorithm, now: u64) -> Result<String> {
+        let mut iter = HeaderIterator::new(message);
+        let mut parsed_headers = Vec::new();
+        for (name, value) in iter.by_ref() {
+            parsed_headers.push((name, value));
+        }
+        let body = iter.body();
+
+        // Collect every occurrence of each requested header, then sign them in
+        // reverse message order (RFC 6376 5.4.2 bottom-up selection semantics,
+        // matching mail-auth's canonicalize + CanonicalHeaders::rev()).
+        let mut occurrences: Vec<(usize, String, &[u8], &[u8])> = Vec::new();
+        for want in &self.headers {
+            for (pos, (name, value)) in parsed_headers.iter().enumerate() {
+                if name.eq_ignore_ascii_case(want.as_bytes()) {
+                    occurrences.push((
+                        pos,
+                        String::from_utf8_lossy(name).into_owned(),
+                        *name,
+                        *value,
+                    ));
+                }
+            }
+        }
+        if occurrences.is_empty() {
+            return Err(Error::Dkim("no signable headers found".into()));
+        }
+        occurrences.sort_by_key(|(pos, _, _, _)| std::cmp::Reverse(*pos));
+
+        let signed_header_names: Vec<String> = occurrences
+            .iter()
+            .map(|(_, name, _, _)| name.clone())
+            .collect();
+        let mut signed_headers_canonical = Vec::new();
+        for (_, _, name, value) in &occurrences {
+            relaxed_canonicalize_header(name, value, &mut signed_headers_canonical);
+        }
+        let bh = compute_body_hash(body, algo)?;
+
+        // Data hash input per RFC 6376 3.7: canonicalized h= headers (each
+        // CRLF-terminated), then the DKIM-Signature header with an empty b=
+        // value and NO trailing CRLF.
+        let mut signed_data = signed_headers_canonical;
+        self.write_signature(&mut signed_data, false, &signed_header_names, now, &bh, "");
+
+        let signature_bytes = match (&self.key, algo) {
+            (PrivateKey::Rsa(k), DkimAlgorithm::RsaSha256) => {
+                let hash = Sha256::digest(&signed_data);
+                k.sign(pkcs1v15_sha256(), &hash)
+                    .map_err(|e| Error::Dkim(format!("RSA sign failed: {e}")))?
+            }
+            (PrivateKey::Rsa(k), DkimAlgorithm::RsaSha1) => {
+                let hash = Sha1::digest(&signed_data);
+                k.sign(pkcs1v15_sha1(), &hash)
+                    .map_err(|e| Error::Dkim(format!("RSA sign failed: {e}")))?
+            }
+            (PrivateKey::Ed25519(k), DkimAlgorithm::Ed25519Sha256) => {
+                let hash = Sha256::digest(&signed_data);
+                k.sign(&hash).to_bytes().to_vec()
+            }
+            _ => unreachable!(),
+        };
+
+        let b = BASE64.encode(&signature_bytes);
+
+        // Transmitted header form (folded with CRLF+WSP, trailing ';').
+        // The trailing CRLF is stripped because insert_dkim_header splices the
+        // header ahead of the message's existing "\r\n\r\n".
+        let mut final_header = Vec::with_capacity(signed_data.len());
+        self.write_signature(&mut final_header, true, &signed_header_names, now, &bh, &b);
+        debug_assert!(final_header.ends_with(b"\r\n"));
+        final_header.truncate(final_header.len() - 2);
+
+        Ok(String::from_utf8_lossy(&final_header).into_owned())
+    }
+
+    /// Byte-exact port of mail-auth's `Signature::write`
+    /// (patches/mail-auth/src/dkim/headers.rs @ bd89ed6).
+    ///
+    /// `as_header = false` renders the form used as data-hash input under
+    /// relaxed header canonicalization: lowercase `dkim-signature:` prefix,
+    /// fold token = single SP, and no trailing newline.
+    /// `as_header = true` renders the transmitted header: `DKIM-Signature: `
+    /// prefix, fold token `\r\n\t`, terminated by `;\r\n`.
+    fn write_signature(
+        &self,
+        writer: &mut Vec<u8>,
+        as_header: bool,
+        h: &[String],
+        t: u64,
+        bh: &str,
+        b: &str,
+    ) {
+        let (header, new_line): (&[u8], &[u8]) = if as_header {
+            (b"DKIM-Signature: ", b"\r\n\t")
+        } else {
+            (b"dkim-signature:", b" ")
+        };
+        writer.extend_from_slice(header);
+        writer.extend_from_slice(b"v=1; a=");
+        writer.extend_from_slice(self.algorithm.as_str().as_bytes());
+        for (tag, value) in [
+            (&b"; s="[..], self.selector.as_bytes()),
+            (&b"; d="[..], self.domain.as_bytes()),
+        ] {
+            writer.extend_from_slice(tag);
+            writer.extend_from_slice(value);
+        }
+        writer.extend_from_slice(b"; c=");
+        writer.extend_from_slice(b"relaxed");
+        writer.extend_from_slice(b"/");
+        writer.extend_from_slice(b"relaxed");
+
+        writer.extend_from_slice(b";");
+        writer.extend_from_slice(new_line);
+
+        let mut bw = 1;
+        for (num, hdr) in h.iter().enumerate() {
+            if bw + hdr.len() + 1 >= 76 {
+                writer.extend_from_slice(new_line);
+                bw = 1;
+            }
+            if num > 0 {
+                write_len(writer, b":", &mut bw);
+            } else {
+                write_len(writer, b"h=", &mut bw);
+            }
+            write_len(writer, hdr.as_bytes(), &mut bw);
+        }
+
+        if t > 0 {
+            let value = t.to_string();
+            write_len(writer, b";", &mut bw);
+            if bw + b"t=".len() + value.len() >= 76 {
+                writer.extend_from_slice(new_line);
+                bw = 1;
+            } else {
+                write_len(writer, b" ", &mut bw);
+            }
+            write_len(writer, b"t=", &mut bw);
+            write_len(writer, value.as_bytes(), &mut bw);
+        }
+
+        for (tag, value) in [(&b"; bh="[..], bh), (&b"; b="[..], b)] {
+            write_len(writer, tag, &mut bw);
+            for &byte in value.as_bytes() {
+                write_len(writer, &[byte], &mut bw);
+                if bw >= 76 {
+                    writer.extend_from_slice(new_line);
+                    bw = 1;
+                }
+            }
+        }
+
+        writer.extend_from_slice(b";");
+        if as_header {
+            writer.extend_from_slice(b"\r\n");
+        }
+    }
+}
+
+fn write_len(writer: &mut Vec<u8>, buf: &[u8], len: &mut usize) {
+    writer.extend_from_slice(buf);
+    *len += buf.len();
+}
+
+fn pkcs1v15_sha256() -> Pkcs1v15Sign {
+    const SHA256_PREFIX: &[u8] = &[
+        0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
+        0x05, 0x00, 0x04, 0x20,
+    ];
+    Pkcs1v15Sign {
+        hash_len: Some(32),
+        prefix: SHA256_PREFIX.into(),
+    }
+}
+
+fn pkcs1v15_sha1() -> Pkcs1v15Sign {
+    const SHA1_PREFIX: &[u8] = &[
+        0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14,
+    ];
+    Pkcs1v15Sign {
+        hash_len: Some(20),
+        prefix: SHA1_PREFIX.into(),
+    }
+}
+
+fn compute_body_hash(body: &[u8], algo: DkimAlgorithm) -> Result<String> {
+    let mut canonical = Vec::new();
+    relaxed_canonicalize_body(body, &mut canonical);
+    let hash_bytes: Vec<u8> = match algo {
+        DkimAlgorithm::RsaSha256 | DkimAlgorithm::Ed25519Sha256 => {
+            Sha256::digest(&canonical).to_vec()
+        }
+        DkimAlgorithm::RsaSha1 => Sha1::digest(&canonical).to_vec(),
+    };
+    Ok(BASE64.encode(&hash_bytes))
+}
+
+#[allow(dead_code)]
+fn split_headers_body(message: &[u8]) -> (&[u8], &[u8]) {
+    if let Some(pos) = message.windows(4).position(|w| w == b"\r\n\r\n") {
+        (&message[..pos], &message[pos + 4..])
+    } else if let Some(pos) = message.windows(2).position(|w| w == b"\n\n") {
+        (&message[..pos], &message[pos + 2..])
+    } else {
+        (message, b"")
+    }
+}
+
+#[allow(dead_code)]
+fn parse_headers(headers: &[u8]) -> Vec<(&[u8], &[u8])> {
+    let mut out = Vec::new();
+    for (name, value) in HeaderIterator::new(headers) {
+        out.push((name, value));
+    }
+    out
+}
+
+fn relaxed_canonicalize_header(name: &[u8], value: &[u8], out: &mut Vec<u8>) {
+    // Name: lowercased, WSP removed, then ":"
+    for &ch in name {
+        if !ch.is_ascii_whitespace() {
+            out.push(ch.to_ascii_lowercase());
+        }
+    }
+    out.push(b':');
+    // Value: unfold (drop CR/LF), compress WSP runs to a single SP, trim
+    // leading/trailing WSP, then terminate with CRLF. Mirrors mail-auth's
+    // canonicalize_headers relaxed branch.
+    let mut tmp = Vec::new();
+    let mut bw_tmp = 0usize;
+    let mut last_ch = 0u8;
+    for &ch in value {
+        if !ch.is_ascii_whitespace() {
+            // Compress runs of WSP to a single SP, but only when the previous
+            // character was an actual space/tab (mail-auth parity; a bare CR
+            // or LF inside the value does not produce a SP).
+            if (last_ch == b' ' || last_ch == b'\t') && bw_tmp > 0 {
+                tmp.push(b' ');
+            }
+            tmp.push(ch);
+            bw_tmp += 1;
+        }
+        last_ch = ch;
+    }
+    out.extend_from_slice(&tmp);
+    out.extend_from_slice(b"\r\n");
+}
+
+fn relaxed_canonicalize_body(body: &[u8], out: &mut Vec<u8>) {
+    // Relaxed body canonicalization:
+    // - Remove trailing WSP at end of each line, compress WSP within line to single SP, remove empty lines at end?
+    // - Actually spec relaxed body: remove trailing WSP, compress WSP, ensure lines end with CRLF, remove trailing empty lines, ensure body ends with CRLF if not empty, else empty.
+    // We can copy mail-auth's CanonicalBody relaxed logic.
+
+    if body.is_empty() {
+        return;
+    }
+
+    let mut last_ch: u8 = 0;
+    let mut crlf_seq: usize = 0;
+    let mut is_empty = true;
+
+    for &ch in body {
+        match ch {
+            b' ' | b'\t' => {
+                while crlf_seq > 0 {
+                    out.extend_from_slice(b"\r\n");
+                    crlf_seq -= 1;
+                }
+                is_empty = false;
+                // don't write yet, wait for next non-WSP to decide if we need SP
+                // But we need to track that we have pending WSP
+                // Actually we need to defer writing WSP until next non-WSP
+                // So we set last_ch to WSP and continue
+            }
+            b'\n' => {
+                crlf_seq += 1;
+            }
+            b'\r' => {}
+            _ => {
+                while crlf_seq > 0 {
+                    out.extend_from_slice(b"\r\n");
+                    crlf_seq -= 1;
+                }
+                if last_ch == b' ' || last_ch == b'\t' {
+                    out.push(b' ');
+                }
+                out.push(ch);
+                is_empty = false;
+            }
+        }
+        last_ch = ch;
+    }
+
+    if !is_empty {
+        out.extend_from_slice(b"\r\n");
+    }
+}
+
+// HeaderIterator copied from mail-auth common/headers
+struct HeaderIterator<'x> {
+    message: &'x [u8],
+    iter: std::iter::Peekable<std::iter::Enumerate<std::slice::Iter<'x, u8>>>,
+    start_pos: usize,
+}
+
+impl<'x> HeaderIterator<'x> {
+    fn new(message: &'x [u8]) -> Self {
+        HeaderIterator {
+            message,
+            iter: message.iter().enumerate().peekable(),
+            start_pos: 0,
+        }
+    }
+
+    fn body(&self) -> &[u8] {
+        let body = self.message.get(self.start_pos..).unwrap_or_default();
+        if body.starts_with(b"\r\n") {
+            &body[2..]
+        } else if body.starts_with(b"\n") {
+            &body[1..]
+        } else {
+            body
+        }
+    }
+}
+
+impl<'x> Iterator for HeaderIterator<'x> {
+    type Item = (&'x [u8], &'x [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut colon_pos = usize::MAX;
+        let mut last_ch = 0;
+
+        while let Some((pos, &ch)) = self.iter.next() {
+            if colon_pos == usize::MAX {
+                match ch {
+                    b':' => {
+                        colon_pos = pos;
+                    }
+                    b'\n' => {
+                        if last_ch == b'\r' || self.start_pos == pos {
+                            return None;
+                        } else if self
+                            .iter
+                            .peek()
+                            .is_none_or(|(_, next_byte)| !b" \t".contains(*next_byte))
+                        {
+                            let header_name = self
+                                .message
+                                .get(self.start_pos..pos + 1)
+                                .unwrap_or_default();
+                            self.start_pos = pos + 1;
+                            return Some((header_name, b""));
+                        }
+                    }
+                    _ => (),
+                }
+            } else if ch == b'\n'
+                && self
+                    .iter
+                    .peek()
+                    .is_none_or(|(_, next_byte)| !b" \t".contains(*next_byte))
+            {
+                let header_name = self
+                    .message
+                    .get(self.start_pos..colon_pos)
+                    .unwrap_or_default();
+                let header_value = self.message.get(colon_pos + 1..pos + 1).unwrap_or_default();
+
+                self.start_pos = pos + 1;
+
+                return Some((header_name, header_value));
+            }
+
+            last_ch = ch;
+        }
+
+        None
+    }
 }
 
 impl DkimManager {
@@ -116,8 +584,12 @@ impl DkimManager {
                 }
                 let key_pem = std::fs::read(&path)?;
                 // Validate the key parses before accepting.
-                parse_key(&key_pem).map_err(|e| {
-                    Error::Config(format!("invalid DKIM key {} (selector {}): {e}", path.display(), selector))
+                let key = parse_key(&key_pem).map_err(|e| {
+                    Error::Config(format!(
+                        "invalid DKIM key {} (selector {}): {e}",
+                        path.display(),
+                        selector
+                    ))
                 })?;
 
                 let inner = entries.entry(domain.clone()).or_default();
@@ -126,7 +598,7 @@ impl DkimManager {
                     DkimEntry {
                         domain: domain.clone(),
                         selector: selector.clone(),
-                        key_pem,
+                        key,
                     },
                 );
             }
@@ -145,14 +617,17 @@ impl DkimManager {
 
     /// True when a signing key exists for `domain` (any selector).
     pub fn has_signer(&self, domain: &str) -> bool {
-        self.entries.get(domain).map(|m| !m.is_empty()).unwrap_or(false)
+        self.entries
+            .get(domain)
+            .map(|m| !m.is_empty())
+            .unwrap_or(false)
     }
 
     /// Build a ready-to-use DKIM signer for `domain`, signing the given
     /// `headers` (they should be a subset of the headers present in the
     /// message being signed). Selects selector via default_selector if present,
     /// else if exactly one selector exists uses it, otherwise fails.
-    pub fn build_signer(&self, domain: &str, headers: &[&str]) -> Result<DkimSigner<DkimKey, Done>> {
+    pub fn build_signer(&self, domain: &str, headers: &[&str]) -> Result<DkimSigner> {
         let inner = self
             .entries
             .get(domain)
@@ -173,11 +648,30 @@ impl DkimManager {
                 self.default_selector
             )));
         };
-        let key = parse_key(&entry.key_pem)?;
-        Ok(DkimSigner::from_key(key)
-            .domain(entry.domain.clone())
-            .selector(entry.selector.clone())
-            .headers(headers.iter().map(|h| (*h).to_string())))
+
+        // Decide algorithm based on key type; default RSA->Sha256, Ed25519->Sha256
+        let algorithm = match &entry.key {
+            PrivateKey::Rsa(_) => DkimAlgorithm::RsaSha256,
+            PrivateKey::Ed25519(_) => DkimAlgorithm::Ed25519Sha256,
+        };
+
+        // Clone key for signer (need to move out, so we need to handle ownership)
+        // We can't move out of entry, so we need to clone the key
+        let key_clone = match &entry.key {
+            PrivateKey::Rsa(k) => PrivateKey::Rsa(k.clone()),
+            PrivateKey::Ed25519(k) => {
+                // ed25519_dalek::SigningKey doesn't impl Clone? It does
+                PrivateKey::Ed25519(ed25519_dalek::SigningKey::from_bytes(&k.to_bytes()))
+            }
+        };
+
+        Ok(DkimSigner {
+            domain: entry.domain.clone(),
+            selector: entry.selector.clone(),
+            headers: headers.iter().map(|h| h.to_string()).collect(),
+            key: key_clone,
+            algorithm,
+        })
     }
 
     pub fn default_selector(&self) -> &str {
@@ -189,27 +683,38 @@ fn is_valid_selector(s: &str) -> bool {
     if s.is_empty() || s.len() > 63 {
         return false;
     }
-    s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Parse a PEM private key into a DKIM signing key, accepting RSA (PKCS1 or
-/// PKCS8) and Ed25519 (PKCS8).
-fn parse_key(pem: &[u8]) -> Result<DkimKey> {
+/// PKCS8) and Ed25519 (PKCS8). Allows 1024-bit RSA.
+fn parse_key(pem: &[u8]) -> Result<PrivateKey> {
     let der = PrivateKeyDer::from_pem_slice(pem)
         .map_err(|e| Error::Dkim(format!("cannot parse private key PEM: {e}")))?;
     match der {
-        PrivateKeyDer::Pkcs1(d) => Ok(DkimKey::Rsa(
-            RsaKey::<Sha256>::from_key_der(PrivateKeyDer::Pkcs1(d))?,
-        )),
+        PrivateKeyDer::Pkcs1(d) => {
+            let k = RsaPrivateKey::from_pkcs1_der(d.secret_pkcs1_der())
+                .map_err(|e| Error::Dkim(format!("invalid RSA PKCS1 key: {e}")))?;
+            Ok(PrivateKey::Rsa(k))
+        }
         PrivateKeyDer::Pkcs8(d) => {
             let bytes = d.secret_pkcs8_der().to_vec();
-            match RsaKey::<Sha256>::from_key_der(PrivateKeyDer::Pkcs8(
-                PrivatePkcs8KeyDer::from(&bytes[..]),
-            )) {
-                Ok(key) => Ok(DkimKey::Rsa(key)),
-                Err(_) => Ok(DkimKey::Ed25519(Ed25519Key::from_pkcs8_der(&bytes)?)),
+            // Try RSA first
+            if let Ok(k) = RsaPrivateKey::from_pkcs8_der(&bytes) {
+                return Ok(PrivateKey::Rsa(k));
             }
+            // Try Ed25519
+            if let Ok(k) = ed25519_dalek::SigningKey::from_pkcs8_der(&bytes) {
+                return Ok(PrivateKey::Ed25519(k));
+            }
+            Err(Error::Dkim(
+                "unsupported private key format for DKIM; use RSA or Ed25519".into(),
+            ))
         }
+        PrivateKeyDer::Sec1(_) => Err(Error::Dkim(
+            "unsupported private key format for DKIM; use RSA or Ed25519".into(),
+        )),
         _ => Err(Error::Dkim(
             "unsupported private key format for DKIM; use RSA or Ed25519".into(),
         )),
@@ -312,7 +817,7 @@ ccRqGWFXwwPUPeTFHVTFnLE=
     #[test]
     fn parses_rsa_key() {
         let key = parse_key(RSA_KEY.as_bytes()).unwrap();
-        assert!(matches!(key, DkimKey::Rsa(_)));
+        assert!(matches!(key, PrivateKey::Rsa(_)));
     }
 
     #[test]
@@ -336,7 +841,6 @@ ccRqGWFXwwPUPeTFHVTFnLE=
         assert_eq!(mgr.len(), 2);
         let signer = mgr.build_signer("example.com", &["From"]).unwrap();
         drop(dir);
-        // ensure default picked (no error)
         let _ = signer;
     }
 
@@ -347,7 +851,6 @@ ccRqGWFXwwPUPeTFHVTFnLE=
         std::fs::create_dir_all(&domain_dir).unwrap();
         write_key(&domain_dir.join("onlyone"), 0o600);
         let mgr = DkimManager::load(&dir.path().join("dkim"), "default").unwrap();
-        // single file, default mismatch → should still succeed via fallback
         assert!(mgr.build_signer("example.com", &["From"]).is_ok());
         drop(dir);
     }
@@ -384,7 +887,6 @@ ccRqGWFXwwPUPeTFHVTFnLE=
         let dir = tempfile::tempdir().unwrap();
         let domain_dir = dir.path().join("dkim/example.com");
         std::fs::create_dir_all(&domain_dir).unwrap();
-        // invalid selector with dot
         let bad = domain_dir.join("bad.selector");
         write_key(&bad, 0o600);
         write_key(&domain_dir.join("good"), 0o600);
@@ -403,12 +905,206 @@ ccRqGWFXwwPUPeTFHVTFnLE=
         std::fs::create_dir_all(&sys_dom).unwrap();
         std::fs::create_dir_all(&usr_dom).unwrap();
         write_key(&sys_dom.join("default"), 0o600);
-        // user overrides same selector with same key (counts as 1 but user wins) and adds extra
         write_key(&usr_dom.join("default"), 0o600);
         write_key(&usr_dom.join("extra"), 0o600);
-        let mgr = DkimManager::load_merged(&sys.path().join("dkim"), &usr.path().join("dkim"), "default").unwrap();
-        assert_eq!(mgr.len(), 2); // default (user) + extra
+        let mgr = DkimManager::load_merged(
+            &sys.path().join("dkim"),
+            &usr.path().join("dkim"),
+            "default",
+        )
+        .unwrap();
+        assert_eq!(mgr.len(), 2);
         drop(sys);
         drop(usr);
+    }
+
+    #[test]
+    fn signs_rsa_sha256() {
+        let key = parse_key(RSA_KEY.as_bytes()).unwrap();
+        let signer = DkimSigner {
+            domain: "example.com".into(),
+            selector: "mail2026".into(),
+            headers: vec!["From".into(), "To".into(), "Subject".into()],
+            key,
+            algorithm: DkimAlgorithm::RsaSha256,
+        };
+        let msg = b"From: a@example.com\r\nTo: b@example.com\r\nSubject: Hi\r\n\r\nbody\r\n";
+        let header = signer.sign(msg).unwrap();
+        assert!(header.starts_with("DKIM-Signature:"));
+        assert!(header.contains("a=rsa-sha256"));
+        assert!(header.contains("d=example.com"));
+        assert!(header.contains("s=mail2026"));
+        assert!(header.contains("bh="));
+        assert!(header.contains("b="));
+    }
+
+    #[test]
+    fn signs_rsa_sha1() {
+        let key = parse_key(RSA_KEY.as_bytes()).unwrap();
+        let signer = DkimSigner {
+            domain: "example.com".into(),
+            selector: "mail2026".into(),
+            headers: vec!["From".into()],
+            key,
+            algorithm: DkimAlgorithm::RsaSha1,
+        };
+        let msg = b"From: a@example.com\r\n\r\nbody\r\n";
+        let header = signer
+            .sign_with_algorithm(msg, DkimAlgorithm::RsaSha1)
+            .unwrap();
+        assert!(header.contains("a=rsa-sha1"));
+        assert!(header.contains("bh="));
+    }
+
+    #[test]
+    fn signs_ed25519() {
+        // Generate ed25519 key for test
+        use ed25519_dalek::SigningKey as EdSigningKey;
+        // Use a fixed seed for deterministic test
+        let seed = [1u8; 32];
+        let sk = EdSigningKey::from_bytes(&seed);
+        let key = PrivateKey::Ed25519(sk);
+        let signer = DkimSigner {
+            domain: "example.com".into(),
+            selector: "ed25519".into(),
+            headers: vec!["From".into()],
+            key,
+            algorithm: DkimAlgorithm::Ed25519Sha256,
+        };
+        let msg = b"From: a@example.com\r\n\r\nbody\r\n";
+        let header = signer.sign(msg).unwrap();
+        assert!(header.contains("a=ed25519-sha256"));
+    }
+
+    #[test]
+    fn verifies_rsa_sha256_roundtrip() {
+        let key = parse_key(RSA_KEY.as_bytes()).unwrap();
+        let signer = DkimSigner {
+            domain: "example.com".into(),
+            selector: "mail2026".into(),
+            headers: vec!["From".into(), "To".into()],
+            key,
+            algorithm: DkimAlgorithm::RsaSha256,
+        };
+        let msg = b"From: a@example.com\r\nTo: b@example.com\r\n\r\nhello\r\n";
+        let header = signer.sign(msg).unwrap();
+        assert!(header.contains("a=rsa-sha256"));
+        assert!(header.contains("bh="));
+        assert!(header.contains("b="));
+        // Check b is base64 and decodes to 256 bytes (2048-bit key)
+        let b_start = header.rfind("; b=").unwrap() + 4;
+        let b_val: String = header[b_start..]
+            .trim_end_matches(';')
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let sig = BASE64.decode(b_val).unwrap();
+        assert_eq!(sig.len(), 256);
+    }
+
+    #[test]
+    fn parses_1024_bit_rsa() {
+        use rsa::traits::PublicKeyParts;
+        // This is the user’s brambles.org/mail 1024-bit key, embedded as test (same as RSA_KEY but 1024)
+        // Generate a 1024-bit key for test
+        let mut rng = rand::thread_rng();
+        let priv_key = RsaPrivateKey::new(&mut rng, 1024).unwrap();
+        let pem = rsa::pkcs8::EncodePrivateKey::to_pkcs8_der(&priv_key).unwrap();
+        let pem_str = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----",
+            BASE64.encode(pem.as_bytes())
+        );
+        let parsed = parse_key(pem_str.as_bytes()).unwrap();
+        match &parsed {
+            PrivateKey::Rsa(k) => assert_eq!(k.size() * 8, 1024),
+            _ => panic!("expected RSA 1024"),
+        }
+        // Sign with it
+        let signer = DkimSigner {
+            domain: "example.com".into(),
+            selector: "test1024".into(),
+            headers: vec!["From".into()],
+            key: parsed,
+            algorithm: DkimAlgorithm::RsaSha256,
+        };
+        let msg = b"From: a@example.com\r\n\r\ntest\r\n";
+        let h = signer.sign(msg).unwrap();
+        assert!(h.contains("b="));
+    }
+
+    const REFERENCE_RSA_PKCS1: &str = concat!(
+        "-----BEGIN RSA PRIVATE KEY-----\n",
+        "MIIEowIBAAKCAQEAv9XYXG3uK95115mB4nJ37nGeNe2CrARm1agrbcnSk5oIaEfM\n",
+        "ZLUR/X8gPzoiNHZcfMZEVR6bAytxUhc5EvZIZrjSuEEeny+fFd/cTvcm3cOUUbIa\n",
+        "UmSACj0dL2/KwW0LyUaza9z9zor7I5XdIl1M53qVd5GI62XBB76FH+Q0bWPZNkT4\n",
+        "NclzTLspD/MTpNCCPhySM4Kdg5CuDczTH4aNzyS0TqgXdtw6A4Sdsp97VXT9fkPW\n",
+        "9rso3lrkpsl/9EQ1mR/DWK6PBmRfIuSFuqnLKY6v/z2hXHxF7IoojfZLa2kZr9Ae\n",
+        "d4l9WheQOTA19k5r2BmlRw/W9CrgCBo0Sdj+KQIDAQABAoIBAFPChEi/OvnulReB\n",
+        "ECQWhOUYuNKlFKQU++2YEvZJ4+bMn5UgnE7wfJ1pj2Pr9xlfALz+OMHNrjMxGbaV\n",
+        "KzdrT2uCkYcf78XjnhuH9gKIiXDUv4L4N+P3u6w8yOx4bFgOS9IjS53yDOPM7SC5\n",
+        "g6dIg5aigHaHlffqIuFFv4yQMI/+Ai+zBKxS7wRhxK/7nnAuo28fe5MEdp57ho9/\n",
+        "AGlDNsdg9zCgjwhokwFE3+AaD+bkUFm4gQ1XjkUFrlmnQn8vDQ0i9toEWhCj+UPY\n",
+        "iOKL63MJnr90MXTXWLHoFj99wBp//mYygbF9Lj8fa28/oa8LWp3Jhb7QeMgH46iv\n",
+        "3aLHbTECgYEA5M2dAw+nyMw9vYlkMejhwObKYP8Mr/6zcGMLCalYvRJM5iUAM0JI\n",
+        "H6sM6pV9/nv167cbKocj3xYPdtE7FPOn4132MLM8Ne1f8nPE64Qrcbj5WBXvLnU8\n",
+        "hpWbwe2Z8h7UUMKx6q4F1/TXYkc3ScxYwfjM4mP/pLsAOgVzRSEEgrUCgYEA1qNQ\n",
+        "xaQHNWZ1O8WuTnqWd5JSsic6iURAmUcLeFDZY2PWhVoaQ8L/xMQhDYs1FIbLWArW\n",
+        "4Qq3Ibu8AbSejAKuaJz7Uf26PX+PYVUwAOO0qamCJ8d/qd6So7qWMDyAY2yXI39Y\n",
+        "1nMqRjr7bkEsggAZao7BKqA7ZtmogjOusBT38iUCgYEA06agJ8TDoKvOMRZ26PRU\n",
+        "YO0dKLzGL8eclcoI29cbj0rud7aiiMg3j5PbTuUat95TjsjDCIQaWrM9etvxm2AJ\n",
+        "Xfn9Uu96MyhyKQWOk46f4YMKpMElkARDCPw8KRhx39dE77AqhLyWCz8iPndCXbH6\n",
+        "KPTOEl4OjYOuof2Is9nnIkECgYBh948RdsnXhNlzm8nwhiGRmBbou+EK8D0v+O5y\n",
+        "Tyy6IcKzgSnFzgZh8EdJ4EUtBk1f9SqY8wQdgIvSl3daXorusuA/TzkngsaV3YUY\n",
+        "ktZOLlF7CKLrjOyPkMWmZKcROmpNyH1q/IvKHHfQnizLdXIkYd4nL5WNX0F7lE1i\n",
+        "j1+QhQKBgB2lviBK7rJFwlFYdQUP1NAN2dKxMZk8uJS8JglHrM0+8nRI83HbTdEQ\n",
+        "vB0ManEKBkbS4T5n+gRtdEqKSDmWDTXDlrBfcdCHNQLwYtBpOotCqQn/AmfjcPBl\n",
+        "byAbwh4+HiZ5JISoRZpiZqy67aJNVoXmdtb/E9mi7ozzytpxMNql\n",
+        "-----END RSA PRIVATE KEY-----\n"
+    );
+
+    #[test]
+    fn matches_mail_auth_reference_vector() {
+        // Golden vector from patched mail-auth's own dkim_sign unit test
+        // (patches/mail-auth @ bd89ed6): identical key, message, headers and
+        // fixed t=311923920 must produce the byte-identical signature.
+        let pk = parse_key(REFERENCE_RSA_PKCS1.as_bytes()).unwrap();
+        let signer = DkimSigner {
+            domain: "stalw.art".into(),
+            selector: "default".into(),
+            headers: vec!["From".into(), "To".into(), "Subject".into()],
+            key: pk,
+            algorithm: DkimAlgorithm::RsaSha256,
+        };
+        let message = concat!(
+            "From: hello@stalw.art\r\n",
+            "To: dkim@stalw.art\r\n",
+            "Subject: Testing  DKIM!\r\n\r\n",
+            "Here goes the test\r\n\r\n"
+        );
+        let header = signer
+            .sign_with_time(message.as_bytes(), DkimAlgorithm::RsaSha256, 311_923_920)
+            .unwrap();
+
+        // mail-auth's canonical (Display) form differs from the emitted header
+        // only in the prefix token and the fold token (SP vs "\r\n\t"); the
+        // byte-width accounting is shared. Convert and compare exactly.
+        let signed_form = header
+            .replacen("DKIM-Signature: ", "dkim-signature:", 1)
+            .replace("\r\n\t", " ");
+        assert_eq!(
+            concat!(
+                "dkim-signature:v=1; a=rsa-sha256; s=default; d=stalw.art; ",
+                "c=relaxed/relaxed; h=Subject:To:From; t=311923920; ",
+                "bh=QoiUNYyUV+1tZ/xUPRcE+gST2zAStvJx1OK078Yl m5s=; ",
+                "b=B/p1FPSJ+Jl4A94381+DTZZnNO4c3fVqDnj0M0Vk5JuvnKb5",
+                "dKSwaoIHPO8UUJsroqH z+R0/eWyW1Vlz+uMIZc2j7MVPJcGaY",
+                "Ni85uCQbPd8VpDKWWab6m21ngXYIpagmzKOKYllyOeK3X qwDz",
+                "Bo0T2DdNjGyMUOAWHxrKGU+fbcPHQYxTBCpfOxE/nc/uxxqh+i",
+                "2uXrsxz7PdCEN01LZiYVV yOzcv0ER9A7aDReE2XPVHnFL8jxE",
+                "2BD53HRv3hGkIDcC6wKOKG/lmID+U8tQk5CP0dLmprgjgTv Se",
+                "bu6xNc6SSIgpvwryAAzJEVwmaBqvE8RNk3Vg10lBZEuNsj2Q==;",
+            ),
+            signed_form
+        );
     }
 }
