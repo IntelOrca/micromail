@@ -16,6 +16,10 @@ tls_listen = "0.0.0.0:465"   # implicit TLS, only when cert+key present
 [[smtp.users]]
 username = "app"
 password = "change-me"
+# allow_auth_insecure = false   # when true, AUTH is accepted on plaintext
+                                 # connections (credentials sent unencrypted).
+                                 # Default false: AUTH requires STARTTLS/TLS.
+# Note: authenticated users may send with any From address; only add trusted users.
 
 [api]
 enabled = true

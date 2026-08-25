@@ -43,6 +43,9 @@ pub fn is_valid_email(addr: &str) -> bool {
     let addr = addr.trim();
     if addr.is_empty()
         || addr.len() > 320
+        // Reject control characters (CR/LF/NUL, ...) so addresses can never
+        // inject or corrupt SMTP command/header streams.
+        || addr.chars().any(char::is_control)
         || addr.contains(' ')
         || addr.starts_with('@')
         || addr.starts_with('.')
@@ -75,6 +78,9 @@ mod tests {
         assert!(!is_valid_email("a@"));
         assert!(!is_valid_email("@b.com"));
         assert!(!is_valid_email("a@b."));
+        assert!(!is_valid_email("a\nx@evil.com"));
+        assert!(!is_valid_email("a\0@b.com"));
+        assert!(!is_valid_email("a@b.com\r\nBcc: x@y.com"));
     }
 
     #[test]

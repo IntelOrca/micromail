@@ -57,6 +57,7 @@ impl SmtpServer {
             max_recipients: self.config.max_recipients,
             spool: self.spool.clone(),
             tls: self.tls.clone(),
+            allow_auth_insecure: self.config.smtp.allow_auth_insecure,
         });
 
         let mut tasks = Vec::new();
@@ -116,6 +117,7 @@ struct Session {
     max_recipients: usize,
     spool: Arc<Spool>,
     tls: Option<Arc<TlsAcceptor>>,
+    allow_auth_insecure: bool,
 }
 
 #[derive(Default)]
@@ -281,6 +283,14 @@ async fn handle(mut stream: StreamBuf<DynStream>, session: Arc<Session>) -> Resu
                     write_reply(&mut stream.inner, "503 5.5.1 AUTH not available\r\n").await?;
                     continue;
                 }
+                if !state.tls_active && !session.allow_auth_insecure {
+                    write_reply(
+                        &mut stream.inner,
+                        "538 5.7.11 Encryption required for authentication\r\n",
+                    )
+                    .await?;
+                    continue;
+                }
                 let (mech, inline_token) = match arg {
                     Some(a) => {
                         let mut parts = a.split_whitespace();
@@ -394,7 +404,7 @@ async fn handle(mut stream: StreamBuf<DynStream>, session: Arc<Session>) -> Resu
                 }
             }
             "MAIL" => {
-                if !require_ready(&mut stream.inner, &state, session.max_recipients).await? {
+                if !require_ready(&mut stream.inner, &state).await? {
                     continue;
                 }
                 let addr = parse_path_address(arg);
@@ -403,12 +413,23 @@ async fn handle(mut stream: StreamBuf<DynStream>, session: Arc<Session>) -> Resu
                         .await?;
                     continue;
                 };
+                // Honor the SIZE parameter we advertise via EHLO.
+                if let Some(size) = declared_size(arg) {
+                    if size > session.max_message_size {
+                        write_reply(
+                            &mut stream.inner,
+                            "552 5.3.4 Message size exceeds fixed maximum message size\r\n",
+                        )
+                        .await?;
+                        continue;
+                    }
+                }
                 state.rcpt_to.clear();
                 state.mail_from = Some(addr);
                 write_reply(&mut stream.inner, "250 2.1.0 Ok\r\n").await?;
             }
             "RCPT" => {
-                if !require_ready(&mut stream.inner, &state, session.max_recipients).await? {
+                if !require_ready(&mut stream.inner, &state).await? {
                     continue;
                 }
                 if state.mail_from.is_none() {
@@ -428,7 +449,7 @@ async fn handle(mut stream: StreamBuf<DynStream>, session: Arc<Session>) -> Resu
                 write_reply(&mut stream.inner, "250 2.1.5 Ok\r\n").await?;
             }
             "DATA" => {
-                if !require_ready(&mut stream.inner, &state, session.max_recipients).await? {
+                if !require_ready(&mut stream.inner, &state).await? {
                     continue;
                 }
                 if state.mail_from.is_none() || state.rcpt_to.is_empty() {
@@ -536,11 +557,7 @@ fn finish_auth(state: &mut ConnState, user: String) {
 }
 
 /// Common checks for MAIL/RCPT/DATA.
-async fn require_ready<S: AsyncWrite + Unpin>(
-    stream: &mut S,
-    state: &ConnState,
-    _max_recipients: usize,
-) -> Result<bool> {
+async fn require_ready<S: AsyncWrite + Unpin>(stream: &mut S, state: &ConnState) -> Result<bool> {
     if !state.ehlo {
         write_reply(stream, "503 5.5.1 Bad sequence of commands\r\n").await?;
         return Ok(false);
@@ -560,7 +577,9 @@ fn ehlo_reply(session: &Session, tls_active: bool) -> String {
     if session.tls.is_some() && !tls_active {
         reply.push_str("250-STARTTLS\r\n");
     }
-    if !session.users.is_empty() {
+    // Only advertise AUTH when it can actually succeed: over TLS, or when
+    // the operator opted into plaintext authentication.
+    if !session.users.is_empty() && (tls_active || session.allow_auth_insecure) {
         reply.push_str("250-AUTH PLAIN LOGIN\r\n");
     }
     reply.push_str("250 OK\r\n");
@@ -579,10 +598,26 @@ fn parse_path_address(arg: Option<&str>) -> Option<String> {
         let end = rest[start + 1..].find('>')? + start + 1;
         &rest[start + 1..end]
     } else {
-        rest
+        // Lenient no-bracket form; stop at ESMTP parameters (SIZE=, BODY=, ...)
+        match rest.split_once(char::is_whitespace) {
+            Some((addr, _params)) => addr,
+            None => rest,
+        }
     };
     let addr = addr.trim().to_string();
     Some(addr)
+}
+
+/// Extract the `SIZE=<n>` ESMTP parameter from a MAIL argument, if present.
+fn declared_size(arg: Option<&str>) -> Option<usize> {
+    let arg = arg?;
+    let idx = arg.to_ascii_uppercase().find("SIZE=")?;
+    let value = arg[idx + "SIZE=".len()..]
+        .split_whitespace()
+        .next()?
+        .parse::<usize>()
+        .ok()?;
+    Some(value)
 }
 
 async fn write_reply<S: AsyncWrite + Unpin>(stream: &mut S, reply: &str) -> Result<()> {
@@ -658,6 +693,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> StreamBuf<S> {
     /// Returns None on EOF before the terminator.
     async fn read_data(&mut self, max_size: usize) -> std::io::Result<Option<Vec<u8>>> {
         let mut data = Vec::new();
+        // One past the last byte of `data` already scanned for a terminator.
+        // Scanning resumes a few bytes earlier so a terminator split across
+        // two reads (or followed by pipelined bytes in the same segment) is
+        // still found.
+        let mut scanned = 0usize;
+        const OVERLAP: usize = DATA_TERM.len() - 1;
         loop {
             // Drain whatever is buffered into `data` first, so a terminator
             // that arrived with the previous `read_more` is found.
@@ -665,10 +706,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> StreamBuf<S> {
                 data.extend_from_slice(&self.buf[self.pos..]);
                 self.pos = self.buf.len();
             }
-            if let Some(idx) = find_terminator(&data, data.len().saturating_sub(5)) {
+            if let Some(idx) = find_terminator(&data, scanned.saturating_sub(OVERLAP)) {
                 let body = data[..idx].to_vec();
                 return Ok(Some(unstuff(&body)));
             }
+            scanned = data.len();
             if data.len() > max_size {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -771,6 +813,10 @@ mod tests {
             parse_path_address(Some("TO:jane@example.com")),
             Some("jane@example.com".to_string())
         );
+        assert_eq!(
+            parse_path_address(Some("FROM:a@b.com SIZE=1000 BODY=8BITMIME")),
+            Some("a@b.com".to_string())
+        );
         assert_eq!(parse_path_address(None), None);
     }
 
@@ -788,12 +834,32 @@ mod tests {
                 .unwrap()
                 .0,
             tls: None,
+            allow_auth_insecure: false,
         };
         let reply = ehlo_reply(&session, false);
         assert!(reply.contains("250-mx.example.com"));
-        assert!(reply.contains("250-AUTH PLAIN LOGIN"));
+        // No TLS and insecure auth disabled: AUTH must not be advertised.
+        assert!(!reply.contains("AUTH"));
         assert!(!reply.contains("STARTTLS"));
         assert!(reply.contains("250-SIZE 1000"));
+
+        let reply_insecure = ehlo_reply(
+            &Session {
+                allow_auth_insecure: true,
+                ..session
+            },
+            false,
+        );
+        assert!(reply_insecure.contains("250-AUTH PLAIN LOGIN"));
+    }
+
+    #[test]
+    fn parses_declared_size() {
+        assert_eq!(declared_size(Some("FROM:<a@b.com> SIZE=1000")), Some(1000));
+        assert_eq!(declared_size(Some("FROM:a@b.com size=42")), Some(42));
+        assert_eq!(declared_size(Some("FROM:<a@b.com> BODY=8BITMIME")), None);
+        assert_eq!(declared_size(Some("FROM:<a@b.com> SIZE=abc")), None);
+        assert_eq!(declared_size(None), None);
     }
 
     #[test]
@@ -836,5 +902,26 @@ mod tests {
         let (line, data) = handle.await.unwrap();
         assert_eq!(line, b"EHLO example.com");
         assert_eq!(data, b"From: a@b.com\r\nTo: c@d.com\r\n\r\n.stuffed\r\n");
+    }
+
+    #[tokio::test]
+    async fn stream_finds_terminator_before_pipelined_bytes() {
+        use tokio::io::duplex;
+
+        // The terminator is followed by further bytes in the same TCP segment
+        // (e.g. a pipelined QUIT); it must still be detected.
+        let (mut client, server) = duplex(1024);
+        let handle = tokio::spawn(async move {
+            let mut buf = StreamBuf::new(server);
+            buf.read_data(1024).await.unwrap().unwrap()
+        });
+
+        client
+            .write_all(b"From: a@b.com\r\n\r\nbody\r\n.\r\nQUIT\r\n")
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+
+        assert_eq!(handle.await.unwrap(), b"From: a@b.com\r\n\r\nbody\r\n");
     }
 }

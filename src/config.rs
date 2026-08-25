@@ -11,8 +11,6 @@ pub fn default_config_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(SYSTEM_CONFIG_DIR))
 }
 
-pub const DEFAULT_CONFIG_DIR: &str = "/etc/micromail";
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -50,6 +48,10 @@ pub struct SmtpConfig {
     pub key: Option<PathBuf>,
     /// Authentication users allowed to submit mail.
     pub users: Vec<SmtpUser>,
+    /// Allow SMTP AUTH on plaintext connections. Credentials then cross the
+    /// network unencrypted; enable only for trusted networks. When false
+    /// (the default), AUTH requires STARTTLS or implicit TLS.
+    pub allow_auth_insecure: bool,
 }
 
 impl Default for SmtpConfig {
@@ -61,6 +63,7 @@ impl Default for SmtpConfig {
             cert: None,
             key: None,
             users: Vec::new(),
+            allow_auth_insecure: false,
         }
     }
 }

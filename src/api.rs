@@ -126,9 +126,14 @@ async fn send_email(State(state): State<AppState>, Json(req): Json<SendRequest>)
         )
             .into_response(),
         Err(e) => {
+            // 4xx can echo the validation error; 5xx must not leak internal
+            // details (paths, spool/IO errors) to the client.
             let (status, msg) = match &e {
                 Error::InvalidInput(_) => (StatusCode::BAD_REQUEST, e.to_string()),
-                _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal server error".to_string(),
+                ),
             };
             tracing::error!("REST send failed: {e}");
             (status, Json(ApiError { error: msg })).into_response()

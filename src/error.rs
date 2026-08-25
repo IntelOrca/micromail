@@ -12,6 +12,13 @@ pub enum Error {
     Dns(String),
     Tls(String),
     InvalidInput(String),
+    /// Some recipients were delivered successfully before the failure.
+    /// Retry logic must only re-send `remaining`, never `delivered`.
+    PartialDelivery {
+        delivered: Vec<String>,
+        remaining: Vec<String>,
+        source: Box<Error>,
+    },
 }
 
 impl fmt::Display for Error {
@@ -26,6 +33,16 @@ impl fmt::Display for Error {
             Error::Dns(e) => write!(f, "dns error: {e}"),
             Error::Tls(e) => write!(f, "tls error: {e}"),
             Error::InvalidInput(e) => write!(f, "invalid input: {e}"),
+            Error::PartialDelivery {
+                delivered,
+                remaining,
+                source,
+            } => write!(
+                f,
+                "partial delivery: {} recipient(s) delivered, {} remaining: {source}",
+                delivered.len(),
+                remaining.len()
+            ),
         }
     }
 }

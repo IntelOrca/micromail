@@ -48,6 +48,8 @@ pub struct Delivery {
     dkim: Arc<DkimManager>,
     relay: Option<Relay>,
     timeout: Duration,
+    /// Shared DNS resolver (re-reads resolv.conf only once, at construction).
+    resolver: hickory_resolver::TokioResolver,
 }
 
 impl Delivery {
@@ -94,10 +96,13 @@ impl Delivery {
             None => None,
         };
 
+        let resolver = build_resolver()?;
+
         Ok(Delivery {
             dkim,
             relay,
             timeout: Duration::from_secs(config.delivery.timeout_secs.max(1)),
+            resolver,
         })
     }
 
@@ -118,6 +123,7 @@ impl Delivery {
                 password: None,
             }),
             timeout: Duration::from_secs(1),
+            resolver: build_resolver().expect("test resolver"),
         }
     }
 
@@ -176,6 +182,10 @@ impl Delivery {
 
     /// Deliver directly to the recipient MX servers. Recipients are grouped by
     /// domain and each group is sent over a connection to that domain's MX.
+    ///
+    /// A failed domain does not abort the remaining domains: when at least one
+    /// group succeeded, [`Error::PartialDelivery`] reports which recipients
+    /// still need (re)delivery so retries never duplicate delivered mail.
     async fn deliver_direct(
         &self,
         from: &str,
@@ -194,38 +204,117 @@ impl Delivery {
             }
         }
 
-        for (domain, rcpts) in &groups {
-            let hosts = resolve_mx(domain).await?;
-            tracing::debug!(domain = %domain, hosts = ?hosts, "resolved MX hosts");
+        let mut delivered: Vec<String> = Vec::new();
+        let mut remaining: Vec<String> = Vec::new();
+        let mut first_err: Option<Error> = None;
 
-            let mut last_err = None;
-            let mut client = None;
-            for host in &hosts {
-                match self
-                    .connect_target(host, 25, TlsMode::Auto, None, None)
-                    .await
-                {
-                    Ok(c) => {
-                        client = Some(c);
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::debug!(host = %host, err = %e, "MX connection failed; trying next");
-                        last_err = Some(e);
-                    }
+        for (domain, rcpts) in &groups {
+            match self
+                .deliver_domain_group(from, domain, rcpts, body, signer)
+                .await
+            {
+                Ok(()) => delivered.extend(rcpts.iter().cloned()),
+                Err(e) => {
+                    tracing::warn!(domain = %domain, err = %e, "domain delivery failed");
+                    remaining.extend(rcpts.iter().cloned());
+                    first_err.get_or_insert(e);
                 }
             }
-            let Some(mut client) = client else {
-                return Err(last_err
-                    .unwrap_or_else(|| Error::Dns(format!("no reachable MX host for {domain}"))));
-            };
-
-            tracing::info!(domain = %domain, rcpts = rcpts.len(), "delivering to domain MX");
-            let message_body = sign_message_if_needed(body, signer)?;
-            let message = Message::new(from.to_string(), rcpts.iter().cloned(), message_body);
-            self.send_message(&mut client, message).await?;
         }
-        Ok(())
+
+        match first_err {
+            None => Ok(()),
+            Some(source) => Err(Error::PartialDelivery {
+                delivered,
+                remaining,
+                source: Box::new(source),
+            }),
+        }
+    }
+
+    /// Deliver one per-domain recipient group over a connection to its MX.
+    async fn deliver_domain_group(
+        &self,
+        from: &str,
+        domain: &str,
+        rcpts: &[String],
+        body: &[u8],
+        signer: Option<&DkimSigner>,
+    ) -> Result<()> {
+        let hosts = self.resolve_mx(domain).await?;
+        tracing::debug!(domain = %domain, hosts = ?hosts, "resolved MX hosts");
+
+        let mut last_err = None;
+        let mut client = None;
+        for host in &hosts {
+            match self
+                .connect_target(host, 25, TlsMode::Auto, None, None)
+                .await
+            {
+                Ok(c) => {
+                    client = Some(c);
+                    break;
+                }
+                Err(e) => {
+                    tracing::debug!(host = %host, err = %e, "MX connection failed; trying next");
+                    last_err = Some(e);
+                }
+            }
+        }
+        let Some(mut client) = client else {
+            return Err(last_err
+                .unwrap_or_else(|| Error::Dns(format!("no reachable MX host for {domain}"))));
+        };
+
+        tracing::info!(domain = %domain, rcpts = rcpts.len(), "delivering to domain MX");
+        let message_body = sign_message_if_needed(body, signer)?;
+        let message = Message::new(from.to_string(), rcpts.iter().cloned(), message_body);
+        self.send_message(&mut client, message).await
+    }
+
+    /// Resolve the MX hosts for a domain, sorted by preference (lowest first).
+    /// Falls back to the domain itself when no MX records exist.
+    async fn resolve_mx(&self, domain: &str) -> Result<Vec<String>> {
+        let resolver = &self.resolver;
+
+        tracing::debug!(domain = %domain, "resolving MX records");
+
+        match resolver.mx_lookup(domain).await {
+            Ok(lookup) => {
+                let mut hosts: Vec<(u16, String)> = lookup
+                    .answers()
+                    .iter()
+                    .filter_map(|record| match &record.data {
+                        hickory_resolver::proto::rr::RData::MX(mx) => {
+                            let host = mx.exchange.to_string().trim_end_matches('.').to_string();
+                            if host.is_empty() {
+                                // Null MX (RFC 7505, e.g. example.com "0 .") — no mail.
+                                None
+                            } else {
+                                Some((mx.preference, host))
+                            }
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if hosts.is_empty() {
+                    // No usable MX (including Null MX 0 .): do not fall back to A
+                    // per RFC 7505 — fail rather than delivering to the apex A record.
+                    return Err(Error::Dns(format!(
+                        "domain {domain} has no mail exchanger (null MX)"
+                    )));
+                }
+                hosts.sort_by_key(|(pref, _)| *pref);
+                Ok(hosts.into_iter().map(|(_, host)| host).collect())
+            }
+            Err(_) => {
+                // No MX record: fall back to an A/AAAA lookup of the domain itself.
+                match resolver.lookup_ip(domain).await {
+                    Ok(_) => Ok(vec![domain.to_string()]),
+                    Err(_) => Err(Error::Dns(format!("cannot resolve mail host for {domain}"))),
+                }
+            }
+        }
     }
 
     async fn send_message<'x>(
@@ -360,53 +449,12 @@ fn box_client<T: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static>(
     }
 }
 
-/// Resolve the MX hosts for a domain, sorted by preference (lowest first).
-/// Falls back to the domain itself when no MX records exist.
-async fn resolve_mx(domain: &str) -> Result<Vec<String>> {
-    use hickory_resolver::TokioResolver;
-
-    tracing::debug!(domain = %domain, "resolving MX records");
-    let resolver = TokioResolver::builder_tokio()
+/// Build the shared DNS resolver used for MX lookups.
+fn build_resolver() -> Result<hickory_resolver::TokioResolver> {
+    hickory_resolver::TokioResolver::builder_tokio()
         .map_err(|e| Error::Dns(e.to_string()))?
         .build()
-        .map_err(|e| Error::Dns(e.to_string()))?;
-
-    match resolver.mx_lookup(domain).await {
-        Ok(lookup) => {
-            let mut hosts: Vec<(u16, String)> = lookup
-                .answers()
-                .iter()
-                .filter_map(|record| match &record.data {
-                    hickory_resolver::proto::rr::RData::MX(mx) => {
-                        let host = mx.exchange.to_string().trim_end_matches('.').to_string();
-                        if host.is_empty() {
-                            // Null MX (RFC 7505, e.g. example.com "0 .") — no mail.
-                            None
-                        } else {
-                            Some((mx.preference, host))
-                        }
-                    }
-                    _ => None,
-                })
-                .collect();
-            if hosts.is_empty() {
-                // No usable MX (including Null MX 0 .): do not fall back to A
-                // per RFC 7505 — fail rather than delivering to the apex A record.
-                return Err(Error::Dns(format!(
-                    "domain {domain} has no mail exchanger (null MX)"
-                )));
-            }
-            hosts.sort_by_key(|(pref, _)| *pref);
-            Ok(hosts.into_iter().map(|(_, host)| host).collect())
-        }
-        Err(_) => {
-            // No MX record: fall back to an A/AAAA lookup of the domain itself.
-            match resolver.lookup_ip(domain).await {
-                Ok(_) => Ok(vec![domain.to_string()]),
-                Err(_) => Err(Error::Dns(format!("cannot resolve mail host for {domain}"))),
-            }
-        }
-    }
+        .map_err(|e| Error::Dns(e.to_string()))
 }
 
 /// Extract the domain part of an email address, lowercased.

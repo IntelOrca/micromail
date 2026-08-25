@@ -316,26 +316,6 @@ fn compute_body_hash(body: &[u8], algo: DkimAlgorithm) -> Result<String> {
     Ok(BASE64.encode(&hash_bytes))
 }
 
-#[allow(dead_code)]
-fn split_headers_body(message: &[u8]) -> (&[u8], &[u8]) {
-    if let Some(pos) = message.windows(4).position(|w| w == b"\r\n\r\n") {
-        (&message[..pos], &message[pos + 4..])
-    } else if let Some(pos) = message.windows(2).position(|w| w == b"\n\n") {
-        (&message[..pos], &message[pos + 2..])
-    } else {
-        (message, b"")
-    }
-}
-
-#[allow(dead_code)]
-fn parse_headers(headers: &[u8]) -> Vec<(&[u8], &[u8])> {
-    let mut out = Vec::new();
-    for (name, value) in HeaderIterator::new(headers) {
-        out.push((name, value));
-    }
-    out
-}
-
 fn relaxed_canonicalize_header(name: &[u8], value: &[u8], out: &mut Vec<u8>) {
     // Name: lowercased, WSP removed, then ":"
     for &ch in name {

@@ -164,6 +164,11 @@ impl Spool {
         };
 
         let attempts = meta.attempts.saturating_add(1);
+        let next = now_secs().saturating_add(
+            retry
+                .initial_delay_secs
+                .saturating_mul(retry.backoff_factor.saturating_pow(attempts - 1)),
+        );
         match delivery.deliver(&meta.from, &meta.to, &body).await {
             Ok(()) => {
                 tracing::info!(
@@ -175,16 +180,32 @@ impl Spool {
                     tracing::error!(dir = %path.display(), "failed to remove delivered message: {e}");
                 }
             }
+            Err(crate::error::Error::PartialDelivery { remaining, .. })
+                if (attempts as usize) < retry.max_attempts =>
+            {
+                // Some recipients were delivered; retry only the remainder so
+                // successful deliveries are never duplicated.
+                tracing::warn!(
+                    from = %meta.from,
+                    remaining = ?remaining,
+                    attempts,
+                    "partial delivery failed; shrinking recipient list for retry"
+                );
+                let updated = Meta {
+                    from: meta.from.clone(),
+                    to: remaining,
+                    created_at: meta.created_at,
+                    attempts,
+                    next_attempt_at: next,
+                };
+                self.update_meta(&path, &updated).await;
+            }
             Err(e) => {
                 tracing::warn!(from = %meta.from, to = ?meta.to, attempts, "delivery failed: {e}");
                 if attempts as usize >= retry.max_attempts {
                     tracing::error!(dir = %path.display(), "giving up after {attempts} attempts");
                     self.park(path).await;
                 } else {
-                    let backoff = retry
-                        .initial_delay_secs
-                        .saturating_mul(retry.backoff_factor.saturating_pow(attempts - 1));
-                    let next = now_secs().saturating_add(backoff);
                     let updated = Meta {
                         from: meta.from.clone(),
                         to: meta.to.clone(),
@@ -192,13 +213,31 @@ impl Spool {
                         attempts,
                         next_attempt_at: next,
                     };
-                    if let Ok(toml) = toml::to_string(&updated) {
-                        if let Err(e) = tokio::fs::write(path.join("meta.toml"), &toml).await {
-                            tracing::error!(dir = %path.display(), "failed to update meta: {e}");
-                        }
-                    }
+                    self.update_meta(&path, &updated).await;
                 }
             }
+        }
+    }
+
+    /// Atomically rewrite `meta.toml`: write to a temp file then rename over
+    /// the target. A crash mid-write can never leave an unparseable meta file.
+    /// (Neither step fsyncs, so a just-acked enqueue may be lost on power
+    /// failure — accepted trade-off for a lightweight MTA.)
+    async fn update_meta(&self, msg_dir: &std::path::Path, meta: &Meta) {
+        let toml = match toml::to_string(meta) {
+            Ok(toml) => toml,
+            Err(e) => {
+                tracing::error!(dir = %msg_dir.display(), "failed to serialize meta: {e}");
+                return;
+            }
+        };
+        let tmp = msg_dir.join(".meta.toml.tmp");
+        if let Err(e) = tokio::fs::write(&tmp, &toml).await {
+            tracing::error!(dir = %msg_dir.display(), "failed to write meta temp file: {e}");
+            return;
+        }
+        if let Err(e) = tokio::fs::rename(&tmp, msg_dir.join("meta.toml")).await {
+            tracing::error!(dir = %msg_dir.display(), "failed to commit meta: {e}");
         }
     }
 

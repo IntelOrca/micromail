@@ -137,6 +137,13 @@ async fn send(
             "at least one recipient is required".into(),
         ));
     }
+    if recipients.len() > config.max_recipients {
+        return Err(micromail::error::Error::InvalidInput(format!(
+            "too many recipients ({}); maximum is {}",
+            recipients.len(),
+            config.max_recipients
+        )));
+    }
 
     if !micromail::message::is_valid_email(&args.from) {
         return Err(micromail::error::Error::InvalidInput(format!(
