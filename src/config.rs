@@ -2,6 +2,15 @@ use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+pub const SYSTEM_CONFIG_DIR: &str = "/etc/micromail";
+
+/// User config dir, e.g. ~/.config/micromail (XDG_CONFIG_HOME aware).
+pub fn default_config_dir() -> PathBuf {
+    dirs::config_dir()
+        .map(|p| p.join("micromail"))
+        .unwrap_or_else(|| PathBuf::from(SYSTEM_CONFIG_DIR))
+}
+
 pub const DEFAULT_CONFIG_DIR: &str = "/etc/micromail";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,9 +174,25 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Load configuration from a directory. A `config.toml` inside the
-    /// directory is optional; when absent, defaults are used.
+    /// Load configuration from a directory. When `dir` is the default user
+    /// config dir (`~/.config/micromail`), merges `SYSTEM_CONFIG_DIR`
+    /// (`/etc/micromail`) as base with user dir overlaying (user wins).
+    /// Otherwise loads solely from `dir`. A `config.toml` inside each dir is
+    /// optional; when absent defaults are used.
     pub fn load(dir: &Path) -> Result<Config> {
+        let system = PathBuf::from(SYSTEM_CONFIG_DIR);
+        let default_user = default_config_dir();
+        let use_merge = dir == default_user && dir != system;
+
+        if use_merge {
+            return Self::load_merged(&system, dir);
+        }
+
+        // Single-dir mode (tests, explicit -c)
+        Self::load_single(dir)
+    }
+
+    fn load_single(dir: &Path) -> Result<Config> {
         let path = dir.join("config.toml");
         let mut config = match std::fs::read(&path) {
             Ok(bytes) => toml::from_slice(&bytes)
@@ -175,8 +200,40 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
             Err(e) => return Err(Error::Config(format!("cannot read {}: {e}", path.display()))),
         };
-
         config.resolve_paths(dir);
+        Ok(config)
+    }
+
+    fn load_merged(system_dir: &Path, user_dir: &Path) -> Result<Config> {
+        let mut base_table: toml::Table = match std::fs::read(system_dir.join("config.toml")) {
+            Ok(bytes) => toml::from_slice(&bytes)
+                .map_err(|e| Error::Config(format!("invalid {}: {e}", system_dir.join("config.toml").display())))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+            Err(e) => return Err(Error::Config(format!("cannot read {}: {e}", system_dir.join("config.toml").display()))),
+        };
+        let overlay_table: Option<toml::Table> = match std::fs::read(user_dir.join("config.toml")) {
+            Ok(bytes) => Some(toml::from_slice(&bytes).map_err(|e| {
+                Error::Config(format!("invalid {}: {e}", user_dir.join("config.toml").display()))
+            })?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(Error::Config(format!("cannot read {}: {e}", user_dir.join("config.toml").display()))),
+        };
+
+        let mut config = if base_table.is_empty() && overlay_table.is_none() {
+            Config::default()
+        } else if let Some(overlay) = overlay_table {
+            merge_tables(&mut base_table, overlay);
+            base_table
+                .try_into()
+                .map_err(|e| Error::Config(format!("invalid merged config: {e}")))?
+        } else {
+            base_table
+                .try_into()
+                .map_err(|e| Error::Config(format!("invalid {}: {e}", system_dir.join("config.toml").display())))?
+
+        };
+
+        config.resolve_paths_merged(user_dir, system_dir);
         Ok(config)
     }
 
@@ -192,6 +249,36 @@ impl Config {
         }
         if self.smtp.key.is_none() {
             for candidate in [dir.join("tls/key.pem"), dir.join("key.pem")] {
+                if candidate.exists() {
+                    self.smtp.key = Some(candidate);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Merged resolve: try user dir first, then system dir.
+    fn resolve_paths_merged(&mut self, user_dir: &Path, system_dir: &Path) {
+        if self.smtp.cert.is_none() {
+            for candidate in [
+                user_dir.join("tls/cert.pem"),
+                user_dir.join("cert.pem"),
+                system_dir.join("tls/cert.pem"),
+                system_dir.join("cert.pem"),
+            ] {
+                if candidate.exists() {
+                    self.smtp.cert = Some(candidate);
+                    break;
+                }
+            }
+        }
+        if self.smtp.key.is_none() {
+            for candidate in [
+                user_dir.join("tls/key.pem"),
+                user_dir.join("key.pem"),
+                system_dir.join("tls/key.pem"),
+                system_dir.join("key.pem"),
+            ] {
                 if candidate.exists() {
                     self.smtp.key = Some(candidate);
                     break;
@@ -218,6 +305,22 @@ impl Config {
     /// Directory where permanently failed messages are parked.
     pub fn failed_dir(&self, dir: &Path) -> PathBuf {
         dir.join("spool").join("failed")
+    }
+}
+
+fn merge_tables(base: &mut toml::Table, overlay: toml::Table) {
+    for (k, v) in overlay {
+        let is_table_merge = matches!(base.get(&k), Some(toml::Value::Table(_)))
+            && matches!(&v, toml::Value::Table(_));
+        if is_table_merge {
+            if let Some(toml::Value::Table(base_tbl)) = base.get_mut(&k) {
+                if let toml::Value::Table(overlay_tbl) = v {
+                    merge_tables(base_tbl, overlay_tbl);
+                    continue;
+                }
+            }
+        }
+        base.insert(k, v);
     }
 }
 
@@ -294,5 +397,34 @@ backoff_factor = 3
         std::fs::write(dir.path().join("tls/key.pem"), "key").unwrap();
         let config = Config::load(dir.path()).unwrap();
         assert!(config.smtp_tls_enabled());
+    }
+
+    #[test]
+    fn merges_system_and_user_configs() {
+        let sys = tempfile::tempdir().unwrap();
+        let usr = tempfile::tempdir().unwrap();
+        std::fs::write(sys.path().join("config.toml"), r#"hostname = "system.example.com""#).unwrap();
+        std::fs::write(usr.path().join("config.toml"), r#"log = "debug""#).unwrap();
+        let cfg = Config::load_merged(sys.path(), usr.path()).unwrap();
+        assert_eq!(cfg.hostname, "system.example.com");
+        assert_eq!(cfg.log, "debug");
+    }
+
+    #[test]
+    fn user_overrides_system() {
+        let sys = tempfile::tempdir().unwrap();
+        let usr = tempfile::tempdir().unwrap();
+        std::fs::write(sys.path().join("config.toml"), r#"hostname = "system.example.com"
+log = "info""#).unwrap();
+        std::fs::write(usr.path().join("config.toml"), r#"hostname = "user.example.com""#).unwrap();
+        let cfg = Config::load_merged(sys.path(), usr.path()).unwrap();
+        assert_eq!(cfg.hostname, "user.example.com");
+        assert_eq!(cfg.log, "info");
+    }
+
+    #[test]
+    fn default_config_dir_ends_with_micromail() {
+        let dir = default_config_dir();
+        assert!(dir.ends_with("micromail"));
     }
 }

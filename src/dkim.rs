@@ -25,44 +25,22 @@ pub struct DkimEntry {
     key_pem: Vec<u8>,
 }
 
-/// Holds the DKIM keys discovered under `<config dir>/dkim/<domain>/`.
+/// Holds the DKIM keys discovered under `<config dir>/dkim/<domain>/<selector>`.
+/// Each selector file's name is the selector and its contents are the PEM private key.
+/// Strict: no legacy `key.pem+selector` file, group/other perms `0o077` rejected.
 pub struct DkimManager {
-    entries: HashMap<String, DkimEntry>,
+    entries: HashMap<String, HashMap<String, DkimEntry>>,
     default_selector: String,
 }
 
 impl DkimManager {
-    /// Scan `dkim_dir` (e.g. `/etc/micromail/dkim`) for per-domain subfolders.
+    /// Scan `dkim_dir` (e.g. `~/.config/micromail/dkim`) for per-domain subfolders.
+    /// New layout: `dkim/<domain>/<selector>` where selector filename contains PEM.
     pub fn load(dkim_dir: &Path, default_selector: &str) -> Result<Self> {
-        let mut entries = HashMap::new();
+        let mut entries: HashMap<String, HashMap<String, DkimEntry>> = HashMap::new();
 
         if dkim_dir.is_dir() {
-            for sub in std::fs::read_dir(dkim_dir)? {
-                let sub = sub?;
-                if !sub.file_type()?.is_dir() {
-                    continue;
-                }
-                let domain = sub.file_name().to_string_lossy().to_lowercase();
-                if domain.is_empty() || domain.starts_with('.') {
-                    continue;
-                }
-                let dir = sub.path();
-                let Some(key_path) = find_key_file(&dir) else {
-                    continue;
-                };
-                let key_pem = std::fs::read(&key_path)?;
-                let selector = read_selector(&dir, default_selector);
-                // Validate the key parses before accepting the domain.
-                parse_key(&key_pem)?;
-                entries.insert(
-                    domain.clone(),
-                    DkimEntry {
-                        domain,
-                        selector,
-                        key_pem,
-                    },
-                );
-            }
+            Self::load_dir_into(dkim_dir, &mut entries)?;
         }
 
         Ok(DkimManager {
@@ -71,28 +49,130 @@ impl DkimManager {
         })
     }
 
-    /// Number of domains with DKIM keys.
+    /// Merged load: system dir as base, user dir overlay (user wins on (domain,selector)).
+    pub fn load_merged(
+        system_dkim_dir: &Path,
+        user_dkim_dir: &Path,
+        default_selector: &str,
+    ) -> Result<Self> {
+        let mut entries: HashMap<String, HashMap<String, DkimEntry>> = HashMap::new();
+        if system_dkim_dir.is_dir() {
+            Self::load_dir_into(system_dkim_dir, &mut entries)?;
+        }
+        if user_dkim_dir.is_dir() && user_dkim_dir != system_dkim_dir {
+            Self::load_dir_into(user_dkim_dir, &mut entries)?;
+        }
+        Ok(DkimManager {
+            entries,
+            default_selector: default_selector.to_string(),
+        })
+    }
+
+    fn load_dir_into(
+        dkim_dir: &Path,
+        entries: &mut HashMap<String, HashMap<String, DkimEntry>>,
+    ) -> Result<()> {
+        for sub in std::fs::read_dir(dkim_dir)? {
+            let sub = sub?;
+            if !sub.file_type()?.is_dir() {
+                continue;
+            }
+            let domain = sub.file_name().to_string_lossy().to_lowercase();
+            if domain.is_empty() || domain.starts_with('.') {
+                continue;
+            }
+            let dir = sub.path();
+            let Ok(files) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for file in files.filter_map(|e| e.ok()) {
+                if !file.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    continue;
+                }
+                let selector_os = file.file_name();
+                let Some(selector_str) = selector_os.to_str() else {
+                    tracing::warn!(path = %file.path().display(), "skipping non-utf8 selector file");
+                    continue;
+                };
+                let selector = selector_str.to_string();
+                if !is_valid_selector(&selector) {
+                    tracing::warn!(path = %file.path().display(), selector = %selector, "skipping file with invalid selector name (expected [A-Za-z0-9_-] 1..63)");
+                    continue;
+                }
+                let path = file.path();
+                // Permission check: fail if group/other have any access (0o077) like SSH
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let meta = std::fs::metadata(&path)?;
+                    let mode = meta.permissions().mode();
+                    if mode & 0o077 != 0 {
+                        return Err(Error::Config(format!(
+                            "insecure permissions {:o} on {}, private key must not be readable by group/other (chmod 600) like SSH",
+                            mode & 0o777,
+                            path.display()
+                        )));
+                    }
+                }
+                let key_pem = std::fs::read(&path)?;
+                // Validate the key parses before accepting.
+                parse_key(&key_pem).map_err(|e| {
+                    Error::Config(format!("invalid DKIM key {} (selector {}): {e}", path.display(), selector))
+                })?;
+
+                let inner = entries.entry(domain.clone()).or_default();
+                inner.insert(
+                    selector.clone(),
+                    DkimEntry {
+                        domain: domain.clone(),
+                        selector: selector.clone(),
+                        key_pem,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Number of (domain,selector) keys.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.values().map(|m| m.len()).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() || self.entries.values().all(|m| m.is_empty())
     }
 
-    /// True when a signing key exists for `domain`.
+    /// True when a signing key exists for `domain` (any selector).
     pub fn has_signer(&self, domain: &str) -> bool {
-        self.entries.contains_key(domain)
+        self.entries.get(domain).map(|m| !m.is_empty()).unwrap_or(false)
     }
 
     /// Build a ready-to-use DKIM signer for `domain`, signing the given
     /// `headers` (they should be a subset of the headers present in the
-    /// message being signed).
+    /// message being signed). Selects selector via default_selector if present,
+    /// else if exactly one selector exists uses it, otherwise fails.
     pub fn build_signer(&self, domain: &str, headers: &[&str]) -> Result<DkimSigner<DkimKey, Done>> {
-        let entry = self
+        let inner = self
             .entries
             .get(domain)
             .ok_or_else(|| Error::Dkim(format!("no DKIM key for domain {domain}")))?;
+        if inner.is_empty() {
+            return Err(Error::Dkim(format!("no DKIM key for domain {domain}")));
+        }
+        let entry = if let Some(e) = inner.get(&self.default_selector) {
+            e
+        } else if inner.len() == 1 {
+            inner.values().next().unwrap()
+        } else {
+            let mut selectors: Vec<String> = inner.keys().cloned().collect();
+            selectors.sort();
+            return Err(Error::Dkim(format!(
+                "multiple DKIM keys for domain {domain} ({}) but none matches default selector {:?}; set dkim_selector_default or keep only one",
+                selectors.join(", "),
+                self.default_selector
+            )));
+        };
         let key = parse_key(&entry.key_pem)?;
         Ok(DkimSigner::from_key(key)
             .domain(entry.domain.clone())
@@ -105,42 +185,11 @@ impl DkimManager {
     }
 }
 
-fn find_key_file(dir: &Path) -> Option<std::path::PathBuf> {
-    const NAMES: &[&str] = &["dkim.pem", "private.pem", "key.pem", "dkim.private.pem", "dkim.key"];
-    for name in NAMES {
-        let path = dir.join(name);
-        if path.is_file() {
-            return Some(path);
-        }
+fn is_valid_selector(s: &str) -> bool {
+    if s.is_empty() || s.len() > 63 {
+        return false;
     }
-    // Fall back to the first *.pem file in the directory.
-    let Ok(files) = std::fs::read_dir(dir) else {
-        return None;
-    };
-    let mut pem_files: Vec<std::path::PathBuf> = files
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_type().map(|t| t.is_file()).unwrap_or(false)
-                && e.file_name().to_string_lossy().ends_with(".pem")
-        })
-        .map(|e| e.path())
-        .collect();
-    pem_files.sort();
-    pem_files.into_iter().next()
-}
-
-fn read_selector(dir: &Path, default_selector: &str) -> String {
-    match std::fs::read_to_string(dir.join("selector")) {
-        Ok(value) => {
-            let value = value.trim().to_string();
-            if value.is_empty() {
-                default_selector.to_string()
-            } else {
-                value
-            }
-        }
-        Err(_) => default_selector.to_string(),
-    }
+    s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Parse a PEM private key into a DKIM signing key, accepting RSA (PKCS1 or
@@ -223,12 +272,20 @@ WYfzaEq7EvsnNGbiV7ToPgNT9weE5Az1Tlhak7HMUo5xsh0oR3gF3GIyeSMYBmG/
 ccRqGWFXwwPUPeTFHVTFnLE=
 -----END PRIVATE KEY-----"#;
 
+    fn write_key(path: &std::path::Path, mode: u32) {
+        std::fs::write(path, RSA_KEY).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+    }
+
     fn key_dir() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let domain_dir = dir.path().join("dkim/example.com");
         std::fs::create_dir_all(&domain_dir).unwrap();
-        std::fs::write(domain_dir.join("dkim.pem"), RSA_KEY).unwrap();
-        std::fs::write(domain_dir.join("selector"), "mail2026\n").unwrap();
+        write_key(&domain_dir.join("mail2026"), 0o600);
         let dkim_root = dir.path().join("dkim");
         (dir, dkim_root)
     }
@@ -236,7 +293,7 @@ ccRqGWFXwwPUPeTFHVTFnLE=
     #[test]
     fn loads_per_domain_keys() {
         let (dir, dkim) = key_dir();
-        let manager = DkimManager::load(&dkim, "default").unwrap();
+        let manager = DkimManager::load(&dkim, "mail2026").unwrap();
         assert_eq!(manager.len(), 1);
         assert!(manager.has_signer("example.com"));
         assert!(!manager.has_signer("other.com"));
@@ -244,13 +301,11 @@ ccRqGWFXwwPUPeTFHVTFnLE=
     }
 
     #[test]
-    fn selector_falls_back_to_default() {
-        let dir = tempfile::tempdir().unwrap();
-        let domain_dir = dir.path().join("dkim/example.org");
-        std::fs::create_dir_all(&domain_dir).unwrap();
-        std::fs::write(domain_dir.join("private.pem"), RSA_KEY).unwrap();
-        let manager = DkimManager::load(&dir.path().join("dkim"), "fallback").unwrap();
-        assert!(manager.has_signer("example.org"));
+    fn builds_signer() {
+        let (dir, dkim) = key_dir();
+        let manager = DkimManager::load(&dkim, "mail2026").unwrap();
+        let signer = manager.build_signer("example.com", &["From", "To", "Subject"]);
+        assert!(signer.is_ok());
         drop(dir);
     }
 
@@ -261,15 +316,6 @@ ccRqGWFXwwPUPeTFHVTFnLE=
     }
 
     #[test]
-    fn builds_signer() {
-        let (dir, dkim) = key_dir();
-        let manager = DkimManager::load(&dkim, "default").unwrap();
-        let signer = manager.build_signer("example.com", &["From", "To", "Subject"]);
-        assert!(signer.is_ok());
-        drop(dir);
-    }
-
-    #[test]
     fn computes_signing_headers() {
         let raw = b"From: a@example.com\r\nTo: b@example.com\r\nSubject: Hi\r\n\r\nbody\r\n";
         let headers = headers_to_sign(raw);
@@ -277,5 +323,92 @@ ccRqGWFXwwPUPeTFHVTFnLE=
         assert!(headers.contains(&"To"));
         assert!(headers.contains(&"Subject"));
         assert!(!headers.contains(&"Message-ID"));
+    }
+
+    #[test]
+    fn multiple_selectors_picks_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain_dir = dir.path().join("dkim/example.com");
+        std::fs::create_dir_all(&domain_dir).unwrap();
+        write_key(&domain_dir.join("default"), 0o600);
+        write_key(&domain_dir.join("mail2026"), 0o600);
+        let mgr = DkimManager::load(&dir.path().join("dkim"), "default").unwrap();
+        assert_eq!(mgr.len(), 2);
+        let signer = mgr.build_signer("example.com", &["From"]).unwrap();
+        drop(dir);
+        // ensure default picked (no error)
+        let _ = signer;
+    }
+
+    #[test]
+    fn single_selector_fallback_when_default_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain_dir = dir.path().join("dkim/example.com");
+        std::fs::create_dir_all(&domain_dir).unwrap();
+        write_key(&domain_dir.join("onlyone"), 0o600);
+        let mgr = DkimManager::load(&dir.path().join("dkim"), "default").unwrap();
+        // single file, default mismatch → should still succeed via fallback
+        assert!(mgr.build_signer("example.com", &["From"]).is_ok());
+        drop(dir);
+    }
+
+    #[test]
+    fn fails_when_multiple_no_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain_dir = dir.path().join("dkim/example.com");
+        std::fs::create_dir_all(&domain_dir).unwrap();
+        write_key(&domain_dir.join("a"), 0o600);
+        write_key(&domain_dir.join("b"), 0o600);
+        let mgr = DkimManager::load(&dir.path().join("dkim"), "missing").unwrap();
+        assert!(mgr.build_signer("example.com", &["From"]).is_err());
+        drop(dir);
+    }
+
+    #[test]
+    fn rejects_insecure_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain_dir = dir.path().join("dkim/example.com");
+        std::fs::create_dir_all(&domain_dir).unwrap();
+        let p = domain_dir.join("default");
+        write_key(&p, 0o644);
+        let res = DkimManager::load(&dir.path().join("dkim"), "default");
+        #[cfg(unix)]
+        assert!(res.is_err());
+        #[cfg(not(unix))]
+        assert!(res.is_ok());
+        drop(dir);
+    }
+
+    #[test]
+    fn ignores_invalid_selector_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain_dir = dir.path().join("dkim/example.com");
+        std::fs::create_dir_all(&domain_dir).unwrap();
+        // invalid selector with dot
+        let bad = domain_dir.join("bad.selector");
+        write_key(&bad, 0o600);
+        write_key(&domain_dir.join("good"), 0o600);
+        let mgr = DkimManager::load(&dir.path().join("dkim"), "good").unwrap();
+        assert_eq!(mgr.len(), 1);
+        assert!(mgr.has_signer("example.com"));
+        drop(dir);
+    }
+
+    #[test]
+    fn merged_load_user_overrides_system() {
+        let sys = tempfile::tempdir().unwrap();
+        let usr = tempfile::tempdir().unwrap();
+        let sys_dom = sys.path().join("dkim/example.com");
+        let usr_dom = usr.path().join("dkim/example.com");
+        std::fs::create_dir_all(&sys_dom).unwrap();
+        std::fs::create_dir_all(&usr_dom).unwrap();
+        write_key(&sys_dom.join("default"), 0o600);
+        // user overrides same selector with same key (counts as 1 but user wins) and adds extra
+        write_key(&usr_dom.join("default"), 0o600);
+        write_key(&usr_dom.join("extra"), 0o600);
+        let mgr = DkimManager::load_merged(&sys.path().join("dkim"), &usr.path().join("dkim"), "default").unwrap();
+        assert_eq!(mgr.len(), 2); // default (user) + extra
+        drop(sys);
+        drop(usr);
     }
 }

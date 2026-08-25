@@ -26,7 +26,10 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
-    let config_dir = cli.config.clone();
+    let config_dir = cli
+        .config
+        .clone()
+        .unwrap_or_else(micromail::config::default_config_dir);
     let config = Config::load(&config_dir)?;
 
     init_tracing(&config, cli.verbose);

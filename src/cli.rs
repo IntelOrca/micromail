@@ -8,9 +8,9 @@ use std::path::PathBuf;
     disable_version_flag = true
 )]
 pub struct Cli {
-    /// Config directory
-    #[arg(short, long, global = true, default_value = crate::config::DEFAULT_CONFIG_DIR)]
-    pub config: PathBuf,
+    /// Config directory [default: ~/.config/micromail]
+    #[arg(short, long, global = true, value_name = "DIR")]
+    pub config: Option<PathBuf>,
 
     /// Verbose logging to the console
     #[arg(short = 'v', long, global = true, action = clap::ArgAction::SetTrue)]
@@ -119,6 +119,14 @@ mod tests {
     #[test]
     fn cli_accepts_config_flag() {
         let cli = Cli::try_parse_from(["micromail", "-c", "/tmp/mm", "serve"]).unwrap();
-        assert_eq!(cli.config, PathBuf::from("/tmp/mm"));
+        assert_eq!(cli.config, Some(PathBuf::from("/tmp/mm")));
+    }
+
+    #[test]
+    fn cli_defaults_to_user_config_dir() {
+        let cli = Cli::try_parse_from(["micromail"]).unwrap();
+        assert_eq!(cli.config, None);
+        let def = crate::config::default_config_dir();
+        assert!(def.ends_with("micromail"));
     }
 }

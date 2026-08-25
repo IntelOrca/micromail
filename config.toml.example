@@ -1,6 +1,6 @@
-# Micromail example config — copy to <config dir>/config.toml
-# Config dir defaults to /etc/micromail (use -c ./dev-config for non-root).
-# All keys are optional; absent file uses defaults shown below.
+# Micromail example config — copy to ~/.config/micromail/config.toml (default) or /etc/micromail/config.toml
+# Default config dir is ~/.config/micromail merged over /etc/micromail (user wins, see src/config.rs:5, default_config_dir).
+# Use -c <dir> to override. All keys are optional; absent file uses defaults shown below.
 hostname = "mail.example.com"
 log = "info"                 # trace, debug, info, warn, error
 max_message_size = 26214400  # 25 MiB
@@ -11,8 +11,8 @@ dkim_selector_default = "default"
 enabled = true
 listen = "0.0.0.0:587"       # plain + STARTTLS
 tls_listen = "0.0.0.0:465"   # implicit TLS, only when cert+key present
-# cert = "/etc/micromail/tls/cert.pem"  # auto: <config>/tls/cert.pem
-# key  = "/etc/micromail/tls/key.pem"   # auto: <config>/tls/key.pem
+# cert = "~/.config/micromail/tls/cert.pem"  # auto: <config>/tls/cert.pem (user > system)
+# key  = "~/.config/micromail/tls/key.pem"   # auto: <config>/tls/key.pem
 [[smtp.users]]
 username = "app"
 password = "change-me"
