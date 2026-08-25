@@ -1,1 +1,7 @@
 /target
+/dev-config/spool/
+/dev-config/spool
+/dev-config/dkim/
+*.captured.eml
+.captured*.eml
+/tmp/

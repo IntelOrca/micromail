@@ -82,7 +82,7 @@ impl SmtpServer {
             )));
         }
 
-        if self.tls.is_some() {
+        if self.tls.is_some() && self.config.smtp.enabled {
             let listener = TcpListener::bind(&self.config.smtp.tls_listen)
                 .await
                 .map_err(|e| {
@@ -259,11 +259,20 @@ async fn handle(mut stream: StreamBuf<DynStream>, session: Arc<Session>) -> Resu
                     write_reply(&mut stream.inner, "503 5.5.1 AUTH not available\r\n").await?;
                     continue;
                 }
-                match arg.unwrap_or("").to_ascii_uppercase().as_str() {
+                let (mech, inline_token) = match arg {
+                    Some(a) => {
+                        let mut parts = a.split_whitespace();
+                        let m = parts.next().unwrap_or("").to_ascii_uppercase();
+                        let t = parts.next().map(|s| s.to_string());
+                        (m, t)
+                    }
+                    None => (String::new(), None),
+                };
+                match mech.as_str() {
                     "PLAIN" => {
-                        // optional base64 argument, else 334 empty challenge
-                        if let Some(token) = arg.and_then(|a| a.split_whitespace().nth(1)) {
-                            match smtp_auth::decode_plain(token) {
+                        // optional base64 argument inline, else 334 empty challenge
+                        if let Some(token) = inline_token {
+                            match smtp_auth::decode_plain(&token) {
                                 Ok((user, pass)) => {
                                     if smtp_auth::authenticate(&session.users, &user, &pass) {
                                         finish_auth(&mut state, user);
@@ -282,8 +291,21 @@ async fn handle(mut stream: StreamBuf<DynStream>, session: Arc<Session>) -> Resu
                         }
                     }
                     "LOGIN" => {
-                        state.auth_phase = Some(AuthPhase::LoginUsername);
-                        write_reply(&mut stream.inner, &format!("334 {}\r\n", smtp_auth::encode_challenge("Username:"))).await?;
+                        if let Some(token) = inline_token {
+                            // Some clients send initial username inline: AUTH LOGIN <b64user>
+                            match smtp_auth::decode_b64(&token) {
+                                Ok(user) => {
+                                    state.auth_phase = Some(AuthPhase::LoginPassword(user));
+                                    write_reply(&mut stream.inner, &format!("334 {}\r\n", smtp_auth::encode_challenge("Password:"))).await?;
+                                }
+                                Err(_) => {
+                                    write_reply(&mut stream.inner, "501 5.5.4 Invalid AUTH response\r\n").await?;
+                                }
+                            }
+                        } else {
+                            state.auth_phase = Some(AuthPhase::LoginUsername);
+                            write_reply(&mut stream.inner, &format!("334 {}\r\n", smtp_auth::encode_challenge("Username:"))).await?;
+                        }
                     }
                     _ => {
                         write_reply(&mut stream.inner, "504 5.5.4 Unsupported authentication mechanism\r\n").await?;

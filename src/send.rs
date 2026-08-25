@@ -324,19 +324,25 @@ async fn resolve_mx(domain: &str) -> Result<Vec<String>> {
                 .answers()
                 .iter()
                 .filter_map(|record| match &record.data {
-                    hickory_resolver::proto::rr::RData::MX(mx) => Some((
-                        mx.preference,
-                        mx.exchange.to_string().trim_end_matches('.').to_string(),
-                    )),
+                    hickory_resolver::proto::rr::RData::MX(mx) => {
+                        let host = mx.exchange.to_string().trim_end_matches('.').to_string();
+                        if host.is_empty() {
+                            // Null MX (RFC 7505, e.g. example.com "0 .") — no mail.
+                            None
+                        } else {
+                            Some((mx.preference, host))
+                        }
+                    }
                     _ => None,
                 })
                 .collect();
-            hosts.sort_by_key(|(pref, _)| *pref);
             if hosts.is_empty() {
-                Ok(vec![domain.to_string()])
-            } else {
-                Ok(hosts.into_iter().map(|(_, host)| host).collect())
+                // No usable MX (including Null MX 0 .): do not fall back to A
+                // per RFC 7505 — fail rather than delivering to the apex A record.
+                return Err(Error::Dns(format!("domain {domain} has no mail exchanger (null MX)")));
             }
+            hosts.sort_by_key(|(pref, _)| *pref);
+            Ok(hosts.into_iter().map(|(_, host)| host).collect())
         }
         Err(_) => {
             // No MX record: fall back to an A/AAAA lookup of the domain itself.

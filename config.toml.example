@@ -1,0 +1,38 @@
+# Micromail example config — copy to <config dir>/config.toml
+# Config dir defaults to /etc/micromail (use -c ./dev-config for non-root).
+# All keys are optional; absent file uses defaults shown below.
+hostname = "mail.example.com"
+log = "info"                 # trace, debug, info, warn, error
+max_message_size = 26214400  # 25 MiB
+max_recipients = 100
+dkim_selector_default = "default"
+
+[smtp]
+enabled = true
+listen = "0.0.0.0:587"       # plain + STARTTLS
+tls_listen = "0.0.0.0:465"   # implicit TLS, only when cert+key present
+# cert = "/etc/micromail/tls/cert.pem"  # auto: <config>/tls/cert.pem
+# key  = "/etc/micromail/tls/key.pem"   # auto: <config>/tls/key.pem
+[[smtp.users]]
+username = "app"
+password = "change-me"
+
+[api]
+enabled = true
+listen = "0.0.0.0:8080"
+tokens = ["change-me-token"]
+
+[dkim]
+enabled = true
+
+[delivery]
+# relay = "smtp.provider.com:587"  # when unset: direct MX to recipient domain
+# relay_username = "u"
+# relay_password = "p"
+relay_tls = "auto"           # auto, starttls, tls, plain
+timeout_secs = 30            # was 300; 30 is sane for direct MX smoke tests
+
+[retry]
+max_attempts = 5
+initial_delay_secs = 60
+backoff_factor = 2
