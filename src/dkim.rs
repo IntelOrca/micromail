@@ -1087,4 +1087,175 @@ ccRqGWFXwwPUPeTFHVTFnLE=
             signed_form
         );
     }
+
+    // The vectors below pin the emitted signature byte-for-byte for message/key
+    // shapes the RSA vector above does not cover. Expected bytes were generated
+    // with this signer and cross-checked against mail-auth 0.11.2's offline DKIM
+    // verifier (independent RFC 6376 canonicalization); mail-auth is NOT a
+    // dependency of this crate. ed25519 signing is deterministic (RFC 8032) and
+    // every vector fixes t=, so outputs are stable.
+
+    /// RFC 8032 Ed25519 test key (same as mail-auth's ED25519_PRIVATE_KEY);
+    /// public key p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=
+    const ED25519_SEED_B64: &str = "nWGxne/9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A=";
+
+    #[test]
+    fn matches_ed25519_reference_vector() {
+        use ed25519_dalek::SigningKey as EdSigningKey;
+        let seed: [u8; 32] = BASE64.decode(ED25519_SEED_B64).unwrap().try_into().unwrap();
+        let pk = PrivateKey::Ed25519(EdSigningKey::from_bytes(&seed));
+        let signer = DkimSigner {
+            domain: "example.com".into(),
+            selector: "ed".into(),
+            headers: vec!["From".into(), "To".into(), "Subject".into()],
+            key: pk,
+            algorithm: DkimAlgorithm::Ed25519Sha256,
+        };
+        let message = concat!(
+            "From: hello@stalw.art\r\n",
+            "To: dkim@stalw.art\r\n",
+            "Subject: Testing  DKIM!\r\n\r\n",
+            "Here goes the test\r\n\r\n"
+        );
+        let header = signer
+            .sign_with_time(
+                message.as_bytes(),
+                DkimAlgorithm::Ed25519Sha256,
+                311_923_920,
+            )
+            .unwrap();
+        let signed_form = header
+            .replacen("DKIM-Signature: ", "dkim-signature:", 1)
+            .replace("\r\n\t", " ");
+        assert_eq!(
+            concat!(
+                "dkim-signature:v=1; a=ed25519-sha256; s=ed; d=example.com; ",
+                "c=relaxed/relaxed; h=Subject:To:From; t=311923920; ",
+                "bh=QoiUNYyUV+1tZ/xUPRcE+gST2zAStvJx1OK078Yl m5s=; ",
+                "b=54jxw+uyT6alxSZqZqTHSfLxxMNwteh+KmAVfABSAI5f4ywBk",
+                "HdFllyeH7XKjD6eHBX d72ap20YWJUvWXfxYAw==;",
+            ),
+            signed_form
+        );
+    }
+
+    #[test]
+    fn matches_reference_vector_duplicate_headers() {
+        // Every occurrence of each h= header must be signed in reverse message
+        // order (RFC 6376 5.4.2): h=Cc:Subject:To:From:To for this message.
+        let key = parse_key(RSA_KEY.as_bytes()).unwrap();
+        let signer = DkimSigner {
+            domain: "example.com".into(),
+            selector: "s2048".into(),
+            headers: vec!["From".into(), "To".into(), "Cc".into(), "Subject".into()],
+            key,
+            algorithm: DkimAlgorithm::RsaSha256,
+        };
+        let message = concat!(
+            "To: one@example.com\r\n",
+            "From: bill@example.com\r\n",
+            "To: two@example.com\r\n",
+            "Subject: Dup\r\n",
+            "Cc: c@example.com\r\n\r\n",
+            "body\r\n"
+        );
+        let header = signer
+            .sign_with_time(message.as_bytes(), DkimAlgorithm::RsaSha256, 1_756_100_000)
+            .unwrap();
+        let signed_form = header
+            .replacen("DKIM-Signature: ", "dkim-signature:", 1)
+            .replace("\r\n\t", " ");
+        assert_eq!(
+            concat!(
+                "dkim-signature:v=1; a=rsa-sha256; s=s2048; d=example.com; ",
+                "c=relaxed/relaxed; h=Cc:Subject:To:From:To; t=1756100000; ",
+                "bh=Ck5SoRNWUpSR4X0COv7R5ub2pUTtl6xz4 dTFz++ji4M=; ",
+                "b=YqQnMzHJXs5Dr65uGRiLHOu0EPTIxYucAKFtD4EQ3aD6m7x/7HyeW6YWPOIr ",
+                "xdYFKIz8bms9CsRd2jWreBaiG3I8R6i24TScao3l0yHquyNlfBZMfmelttejJ6cjWQEAyhH/ZWi ",
+                "QJyVOSWNIe1Ahp5ahCEbG0NwlfhFma7Clyb1esQldiUt3Icxx8zxYp9gYqjzBjwC3Lnxse1jDzE ",
+                "2mEV4e9U0JYEERj4IWF2pZ2OVQr2XOKrpvRLnBlsxK4fP1eYj9r9QnZjKrXf3xCrKUVZlN+dK/S ",
+                "m/w9+sC2SkNyWmsI7BoFt7xr3jH3pBcDFiCyf966eNslK9l87HMtUnLcA==;",
+            ),
+            signed_form
+        );
+    }
+
+    #[test]
+    fn matches_reference_vector_whitespace_body() {
+        // Relaxed body canonicalization: strip trailing WSP per line, compress
+        // inner WSP runs to single SP, drop trailing empty lines.
+        let key = parse_key(RSA_KEY.as_bytes()).unwrap();
+        let signer = DkimSigner {
+            domain: "example.com".into(),
+            selector: "s2048".into(),
+            headers: vec!["From".into(), "To".into(), "Subject".into()],
+            key,
+            algorithm: DkimAlgorithm::RsaSha256,
+        };
+        let message = concat!(
+            "From: a@example.com\r\n",
+            "To: b@example.com\r\n",
+            "Subject: WSP Test\r\n\r\n",
+            "line   with\ttabs   \r\n",
+            "next  line  \r\n\r\n\r\n"
+        );
+        let header = signer
+            .sign_with_time(message.as_bytes(), DkimAlgorithm::RsaSha256, 1_756_100_001)
+            .unwrap();
+        let signed_form = header
+            .replacen("DKIM-Signature: ", "dkim-signature:", 1)
+            .replace("\r\n\t", " ");
+        assert_eq!(
+            concat!(
+                "dkim-signature:v=1; a=rsa-sha256; s=s2048; d=example.com; ",
+                "c=relaxed/relaxed; h=Subject:To:From; t=1756100001; ",
+                "bh=aWEYJY1JuVJX863P/e9X5RqSVFfqgnaavHQ0stQ D/0s=; ",
+                "b=b1x5akK8y1mEv07hsuhPDmvNF9i9LZmawjZCiaH4Qba5+LmKt0IUq1XXHTqeXT81qd ",
+                "t9O+KcGAoGv8Bsfg61B6nruYSVJAkXdijDIBgITcpsiIQTbcRz39SVDOHW8HvFMSgq1D1m84SmP ",
+                "LynebIt/81ohiXHPyCo2ITfcSaNS5R81tmsnKEAudanW9+LYMQc59hjgBmLlrtOYMel/R0G3iF+ ",
+                "oQcSxs+oyKKrMIyphH4AQjL9Xl5mQRQbjsvqdu4+kbB6hmTv0j4W8/+QX7de1z4fJ4ITC59fysk ",
+                "lW14Qp5/99fVC8xJwZT1Zi3KldjkRtu6koUV06FzUuV6RyptxkA==;",
+            ),
+            signed_form
+        );
+    }
+
+    #[test]
+    fn matches_reference_vector_empty_body() {
+        // Empty body hashes to sha256("") under relaxed canonicalization
+        // (bh=47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=).
+        let key = parse_key(RSA_KEY.as_bytes()).unwrap();
+        let signer = DkimSigner {
+            domain: "example.com".into(),
+            selector: "s2048".into(),
+            headers: vec!["From".into(), "To".into(), "Subject".into()],
+            key,
+            algorithm: DkimAlgorithm::RsaSha256,
+        };
+        let message = concat!(
+            "From: e@example.com\r\n",
+            "To: f@example.com\r\n",
+            "Subject: Empty\r\n\r\n",
+            "\r\n"
+        );
+        let header = signer
+            .sign_with_time(message.as_bytes(), DkimAlgorithm::RsaSha256, 1_756_100_002)
+            .unwrap();
+        let signed_form = header
+            .replacen("DKIM-Signature: ", "dkim-signature:", 1)
+            .replace("\r\n\t", " ");
+        assert_eq!(
+            concat!(
+                "dkim-signature:v=1; a=rsa-sha256; s=s2048; d=example.com; ",
+                "c=relaxed/relaxed; h=Subject:To:From; t=1756100002; ",
+                "bh=47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3h SuFU=; ",
+                "b=XZWu0hbg2urQuqgrpBpFPBUR8JnmtzVbjg39DCbIfiHNbVzNqVRoEwZ8/xsVoEwWl9 ",
+                "JCfgYNm6AFsbtOcF+Tv5msnXXOGPO9gluujmdHi38wStcc4iySw/+JxSf3b+tk56xIIvr8vZkN3 ",
+                "Mnayqle3RbBKr4OdJajJtKNGnp2pybMiZLsamgmFKMlGoYqk60vbjcIdUP2dv4RyQ/06PNBGKC9 ",
+                "1Ee4juF0c7Sk07jbS7psuhbalU2uP+H208WDrHsloZ6Y8E1dcUAus9kwtTSzX9pag8IumfZBUiq ",
+                "+iX9hOFIBOE6xWzZEwkKJadeFSbPLZg0OePOnSGNI4CyxmyUmBw==;",
+            ),
+            signed_form
+        );
+    }
 }
