@@ -11,7 +11,7 @@ jobs:
     name: Format, clippy, test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -27,3 +27,14 @@ jobs:
 
       - name: Tests
         run: cargo test
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: micromail-x86_64-linux
+          path: target/release/micromail
+          archive: false
+          if-no-files-found: error
