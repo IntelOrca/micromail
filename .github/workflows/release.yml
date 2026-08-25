@@ -44,7 +44,6 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: linux-x86_64
           path: micromail-*-x86_64-linux
           archive: false
           if-no-files-found: error
@@ -78,7 +77,6 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: windows-x86_64
           path: micromail-*-x86_64-windows.exe
           archive: false
           if-no-files-found: error
@@ -91,7 +89,7 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
-          pattern: "{linux-x86_64,windows-x86_64}"
+          pattern: "micromail-*-x86_64-*"
           merge-multiple: true
           path: dist
 
