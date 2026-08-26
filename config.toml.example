@@ -26,15 +26,12 @@ enabled = true
 listen = "0.0.0.0:8080"
 tokens = ["change-me-token"]
 
-[dkim]
-enabled = true
-
 [delivery]
 # relay = "smtp.provider.com:587"  # when unset: direct MX to recipient domain
 # relay_username = "u"
 # relay_password = "p"
 relay_tls = "auto"           # auto, starttls, tls, plain
-timeout_secs = 30            # was 300; 30 is sane for direct MX smoke tests
+timeout_secs = 30            # default 300; 30 suits direct-MX smoke tests
 
 [retry]
 max_attempts = 5

@@ -54,29 +54,20 @@ pub struct Delivery {
 
 impl Delivery {
     pub fn from_config(config: &Config, config_dir: &std::path::Path) -> Result<Self> {
-        let dkim = if config.dkim.enabled {
-            let user_dkim = config.dkim_dir(config_dir);
-            let system_dkim =
-                std::path::PathBuf::from(crate::config::SYSTEM_CONFIG_DIR).join("dkim");
-            let default_user = crate::config::default_config_dir();
-            let dkim = if config_dir == default_user
-                && config_dir != std::path::Path::new(crate::config::SYSTEM_CONFIG_DIR)
-            {
-                Arc::new(DkimManager::load_merged(
-                    &system_dkim,
-                    &user_dkim,
-                    &config.dkim_selector_default,
-                )?)
-            } else {
-                Arc::new(DkimManager::load(
-                    &user_dkim,
-                    &config.dkim_selector_default,
-                )?)
-            };
-            dkim
+        let user_dkim = config.dkim_dir(config_dir);
+        let system_dkim = std::path::PathBuf::from(crate::config::SYSTEM_CONFIG_DIR).join("dkim");
+        let default_user = crate::config::default_config_dir();
+        let dkim = if config_dir == default_user
+            && config_dir != std::path::Path::new(crate::config::SYSTEM_CONFIG_DIR)
+        {
+            Arc::new(DkimManager::load_merged(
+                &system_dkim,
+                &user_dkim,
+                &config.dkim_selector_default,
+            )?)
         } else {
             Arc::new(DkimManager::load(
-                &std::path::PathBuf::new(),
+                &user_dkim,
                 &config.dkim_selector_default,
             )?)
         };

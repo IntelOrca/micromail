@@ -27,7 +27,6 @@ pub struct Config {
 
     pub smtp: SmtpConfig,
     pub api: ApiConfig,
-    pub dkim: DkimConfig,
     pub delivery: DeliveryConfig,
     pub retry: RetryConfig,
 }
@@ -97,19 +96,6 @@ impl Default for ApiConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct DkimConfig {
-    /// Enable DKIM signing.
-    pub enabled: bool,
-}
-
-impl Default for DkimConfig {
-    fn default() -> Self {
-        DkimConfig { enabled: true }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
 pub struct DeliveryConfig {
     /// Optional SMTP relay host, e.g. "smtp.provider.com:587".
     /// When unset, mail is delivered directly to the recipient's MX.
@@ -169,7 +155,6 @@ impl Default for Config {
             dkim_selector_default: "default".into(),
             smtp: SmtpConfig::default(),
             api: ApiConfig::default(),
-            dkim: DkimConfig::default(),
             delivery: DeliveryConfig::default(),
             retry: RetryConfig::default(),
         }
@@ -476,5 +461,18 @@ log = "info""#,
     fn default_config_dir_ends_with_micromail() {
         let dir = default_config_dir();
         assert!(dir.ends_with("micromail"));
+    }
+
+    #[test]
+    fn example_config_parses() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.toml.example");
+        let bytes = std::fs::read(&path).unwrap();
+        let config: Config = toml::from_slice(&bytes).unwrap();
+        assert_eq!(config.hostname, "mail.example.com");
+        assert_eq!(config.dkim_selector_default, "default");
+        assert!(config.smtp.enabled);
+        assert!(config.api.enabled);
+        assert_eq!(config.delivery.relay_tls, "auto");
+        assert_eq!(config.retry.max_attempts, 5);
     }
 }
