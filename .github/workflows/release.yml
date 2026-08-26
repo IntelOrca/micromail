@@ -97,5 +97,6 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: dist/*
-          generate_release_notes: true
+          # Release body comes from the annotated tag message (no GitHub auto notes).
+          generate_release_notes: false
           fail_on_unmatched_files: true
