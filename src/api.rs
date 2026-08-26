@@ -90,20 +90,26 @@ async fn auth(
     req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    let authorized = req
+    let bearer = req
         .headers()
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|token| {
-            state
-                .config
-                .api
-                .tokens
-                .iter()
-                .any(|expected| constant_time_eq(expected.as_bytes(), token.as_bytes()))
-        })
-        .unwrap_or(false);
+        .map(str::to_string);
+
+    let authorized = match bearer {
+        Some(bearer) => {
+            let tokens = state.config.api.tokens.clone();
+            // Argon2 verification is CPU/memory-heavy; keep it off the
+            // async worker threads. Deny on join failure (safe default).
+            tokio::task::spawn_blocking(move || {
+                tokens.iter().any(|expected| expected.token.verify(&bearer))
+            })
+            .await
+            .unwrap_or(false)
+        }
+        None => false,
+    };
 
     if authorized {
         next.run(req).await
@@ -193,20 +199,15 @@ async fn build_and_enqueue(state: &AppState, req: &SendRequest) -> Result<String
     state.spool.enqueue(from, recipients, body).await
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ApiToken;
+    use crate::secret::Secret;
+    use argon2::password_hash::{PasswordHasher, SaltString};
+    use argon2::{Algorithm, Argon2, Params, Version};
+    use axum::body::Body;
+    use tower::ServiceExt;
 
     #[tokio::test]
     async fn rejects_invalid_recipients() {
@@ -258,5 +259,120 @@ mod tests {
         };
         let id = build_and_enqueue(&state, &req).await.unwrap();
         assert!(!id.is_empty());
+    }
+
+    /// Hash with deliberately weak parameters so tests stay fast.
+    fn fast_phc_hash(password: &str) -> String {
+        let salt =
+            SaltString::from_b64("c3RhdGljIHNhbHQgMTIzNDU2").expect("valid static test salt");
+        let params = Params::new(1024, 1, 1, Some(32)).expect("valid static test params");
+        let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+        argon
+            .hash_password(password.as_bytes(), &salt)
+            .expect("test password hashes")
+            .to_string()
+    }
+
+    fn authed_router(tokens: Vec<ApiToken>) -> Router {
+        let mut config = Config::default();
+        config.api.tokens = tokens;
+        let (spool, _rx) = Spool::open(std::env::temp_dir().join("mm-test-api-auth")).unwrap();
+        router(Arc::new(config), spool)
+    }
+
+    async fn post_send(app: Router, bearer: Option<&str>) -> StatusCode {
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/send")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"from":"a@b.com","to":["c@d.com"],"text":"hi"}"#,
+            ))
+            .unwrap();
+        if let Some(bearer) = bearer {
+            request
+                .headers_mut()
+                .insert(AUTHORIZATION, format!("Bearer {bearer}").parse().unwrap());
+        }
+        let response = app.oneshot(request).await.unwrap();
+        response.status()
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_bearer() {
+        let app = authed_router(vec![ApiToken {
+            name: "ci".into(),
+            token: Secret::Literal("tok-1".into()),
+        }]);
+        assert_eq!(post_send(app, None).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_bearer() {
+        let app = authed_router(vec![ApiToken {
+            name: "ci".into(),
+            token: Secret::Literal("tok-1".into()),
+        }]);
+        assert_eq!(
+            post_send(app.clone(), Some("nope")).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            post_send(app, Some("TOK-1")).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_literal_token() {
+        let app = authed_router(vec![
+            ApiToken {
+                name: "ci".into(),
+                token: Secret::Literal("tok-1".into()),
+            },
+            ApiToken {
+                name: "deploy".into(),
+                token: Secret::Literal("tok-2".into()),
+            },
+        ]);
+        assert_eq!(
+            post_send(app.clone(), Some("tok-2")).await,
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(post_send(app, Some("nope")).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn accepts_argon2_token() {
+        let app = authed_router(vec![ApiToken {
+            name: "ci".into(),
+            token: Secret::Argon2(fast_phc_hash("tok-argon")),
+        }]);
+        assert_eq!(
+            post_send(app.clone(), Some("tok-argon")).await,
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            post_send(app, Some("wrong")).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn health_needs_no_auth() {
+        let app = authed_router(vec![ApiToken {
+            name: "ci".into(),
+            token: Secret::Literal("tok-1".into()),
+        }]);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

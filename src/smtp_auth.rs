@@ -36,32 +36,54 @@ pub fn encode_challenge(label: &str) -> String {
     STANDARD.encode(label.as_bytes())
 }
 
-/// Check credentials against the configured users.
+/// Check credentials against the configured users. Usernames are matched
+/// ASCII case-insensitively; passwords are verified exactly.
 pub fn authenticate(users: &[SmtpUser], username: &str, password: &str) -> bool {
-    users.iter().any(|u| {
-        constant_time_eq(u.username.as_bytes(), username.as_bytes())
-            && constant_time_eq(u.password.as_bytes(), password.as_bytes())
-    })
+    users
+        .iter()
+        .any(|u| u.username.eq_ignore_ascii_case(username) && u.password.verify(password))
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+/// [`authenticate`] off the async worker threads. Argon2 verification is
+/// CPU- and memory-heavy; running it inline would stall other connections.
+pub async fn authenticate_async(users: &[SmtpUser], username: &str, password: &str) -> bool {
+    let users = users.to_vec();
+    let username = username.to_string();
+    let password = password.to_string();
+    tokio::task::spawn_blocking(move || authenticate(&users, &username, &password))
+        .await
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secret::Secret;
+    use argon2::password_hash::{PasswordHasher, SaltString};
+    use argon2::{Algorithm, Argon2, Params, Version};
     use base64::{engine::general_purpose::STANDARD, Engine};
 
     fn plain(user: &str, pass: &str) -> String {
         STANDARD.encode(format!("\0{user}\0{pass}"))
+    }
+
+    fn literal_user(username: &str, password: &str) -> SmtpUser {
+        SmtpUser {
+            username: username.into(),
+            password: Secret::Literal(password.into()),
+        }
+    }
+
+    /// Hash with deliberately weak parameters so tests stay fast.
+    fn fast_phc_hash(password: &str) -> String {
+        let salt =
+            SaltString::from_b64("c3RhdGljIHNhbHQgMTIzNDU2").expect("valid static test salt");
+        let params = Params::new(1024, 1, 1, Some(32)).expect("valid static test params");
+        let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+        argon
+            .hash_password(password.as_bytes(), &salt)
+            .expect("test password hashes")
+            .to_string()
     }
 
     #[test]
@@ -94,13 +116,29 @@ mod tests {
 
     #[test]
     fn authenticates_users() {
-        let users = vec![SmtpUser {
-            username: "app".into(),
-            password: "hunter2".into(),
-        }];
+        let users = vec![literal_user("app", "hunter2")];
         assert!(authenticate(&users, "app", "hunter2"));
         assert!(!authenticate(&users, "app", "wrong"));
         assert!(!authenticate(&users, "nobody", "hunter2"));
         assert!(!authenticate(&users, "app", ""));
+    }
+
+    #[test]
+    fn usernames_are_case_insensitive() {
+        let users = vec![literal_user("App", "hunter2")];
+        assert!(authenticate(&users, "APP", "hunter2"));
+        assert!(authenticate(&users, "app", "hunter2"));
+        assert!(authenticate(&users, "aPp", "hunter2"));
+        assert!(!authenticate(&users, "application", "hunter2"));
+    }
+
+    #[test]
+    fn authenticates_argon2_password() {
+        let users = vec![SmtpUser {
+            username: "app".into(),
+            password: Secret::Argon2(fast_phc_hash("hunter2")),
+        }];
+        assert!(authenticate(&users, "app", "hunter2"));
+        assert!(!authenticate(&users, "app", "wrong"));
     }
 }

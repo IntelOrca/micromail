@@ -5,6 +5,7 @@ pub mod dkim;
 pub mod error;
 pub mod message;
 pub mod queue;
+pub mod secret;
 pub mod send;
 pub mod smtp;
 pub mod smtp_auth;

@@ -54,10 +54,13 @@ hostname = "mail.example.com"
 
 [[smtp.users]]
 username = "app"
-password = "change-me"
+password = "literal:change-me"
 
 [api]
-tokens = ["change-me-token"]
+
+[[api.tokens]]
+name = "ci-server"
+token = "literal:change-me-token"
 ```
 
 Start the daemon:
@@ -141,6 +144,7 @@ points at exactly one directory instead.
 
 Per-user credentials via `[[smtp.users]]`: `username`, `password`,
 and optional `allow_auth_insecure` (`false` by default — AUTH requires TLS).
+Usernames are matched ASCII case-insensitively; passwords exactly.
 
 **`[api]`**
 
@@ -148,14 +152,14 @@ and optional `allow_auth_insecure` (`false` by default — AUTH requires TLS).
 |---|---|---|
 | `enabled` | `true` | |
 | `listen` | `"0.0.0.0:8080"` | |
-| `tokens` | `[]` | Bearer tokens accepted by `POST /send` |
+| `[[api.tokens]]` | `[]` | Bearer tokens accepted by `POST /send`; each has a `name` (identifier) and `token` |
 
 **`[delivery]`**
 
 | Key | Default | Description |
 |---|---|---|
 | `relay` | unset | Unset = direct MX delivery; e.g. `"smtp.provider.com:587"` |
-| `relay_username` / `relay_password` | — | Relay credentials |
+| `relay_username` / `relay_password` | — | Relay credentials (`relay_password` accepts `literal:` only) |
 | `relay_tls` | `"auto"` | `auto`, `starttls`, `tls`, `plain` |
 | `timeout_secs` | `300` | Per-delivery timeout |
 
@@ -205,6 +209,39 @@ Notes:
   it is used instead. Multiple selectors make rotation a drop-in affair.
 - Verify end-to-end by sending a test mail and checking the `DKIM-Signature` header /
   `Authentication-Results: dkim=pass`.
+
+</details>
+
+<details>
+<summary><strong>Credential storage prefixes</strong></summary>
+
+Passwords and API tokens must carry a prefix declaring how they are stored:
+
+| Prefix | Meaning |
+|---|---|
+| `literal:<value>` | Plaintext secret, compared in constant time |
+| `argon2:<PHC string>` | Argon2 hash; candidates are verified with Argon2id using the parameters embedded in the hash |
+
+```toml
+[[smtp.users]]
+username = "app"
+password = "argon2:$argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>"
+
+[[api.tokens]]
+name = "ci-server"
+token = "literal:change-me-token"
+```
+
+Generate an Argon2id PHC string with any standard tool, e.g.
+`echo -n "change-me" | argon2 "$(head -c 16 /dev/urandom | base64)" -id -t 2 -m 14 -p 1 -e`.
+
+Unprefixed values are rejected at startup. `delivery.relay_password` accepts
+`literal:` only — the plaintext is required to authenticate against the remote relay.
+
+Note that each `argon2:` verification costs ~19 MiB of memory and tens of
+milliseconds of CPU (SMTP AUTH attempts and API requests are verified off the
+async runtime, but the cost per attempt still applies). Prefer `literal:`
+secrets for high-throughput endpoints.
 
 </details>
 

@@ -186,7 +186,7 @@ async fn handle(mut stream: StreamBuf<DynStream>, session: Arc<Session>) -> Resu
             match phase {
                 AuthPhase::PlainChallenge => match smtp_auth::decode_plain(text) {
                     Ok((user, pass)) => {
-                        if smtp_auth::authenticate(&session.users, &user, &pass) {
+                        if smtp_auth::authenticate_async(&session.users, &user, &pass).await {
                             finish_auth(&mut state, user);
                             write_reply(
                                 &mut stream.inner,
@@ -223,7 +223,7 @@ async fn handle(mut stream: StreamBuf<DynStream>, session: Arc<Session>) -> Resu
                 },
                 AuthPhase::LoginPassword(user) => match smtp_auth::decode_b64(text) {
                     Ok(pass) => {
-                        if smtp_auth::authenticate(&session.users, &user, &pass) {
+                        if smtp_auth::authenticate_async(&session.users, &user, &pass).await {
                             finish_auth(&mut state, user);
                             write_reply(
                                 &mut stream.inner,
@@ -295,7 +295,9 @@ async fn handle(mut stream: StreamBuf<DynStream>, session: Arc<Session>) -> Resu
                         if let Some(token) = inline_token {
                             match smtp_auth::decode_plain(&token) {
                                 Ok((user, pass)) => {
-                                    if smtp_auth::authenticate(&session.users, &user, &pass) {
+                                    if smtp_auth::authenticate_async(&session.users, &user, &pass)
+                                        .await
+                                    {
                                         finish_auth(&mut state, user);
                                         write_reply(
                                             &mut stream.inner,
@@ -815,7 +817,7 @@ mod tests {
             hostname: "mx.example.com".into(),
             users: vec![SmtpUser {
                 username: "u".into(),
-                password: "p".into(),
+                password: crate::secret::Secret::Literal("p".into()),
             }],
             max_message_size: 1000,
             max_recipients: 10,

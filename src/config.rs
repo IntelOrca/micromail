@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::secret::Secret;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -70,7 +71,16 @@ impl Default for SmtpConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SmtpUser {
     pub username: String,
-    pub password: String,
+    /// Credential with storage scheme prefix: `literal:pw` or `argon2:<PHC>`.
+    pub password: Secret,
+}
+
+/// A named REST API bearer token. `name` identifies the token holder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiToken {
+    pub name: String,
+    /// Credential with storage scheme prefix: `literal:tok` or `argon2:<PHC>`.
+    pub token: Secret,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,7 +91,7 @@ pub struct ApiConfig {
     /// Address to bind for the REST API (usually :8080).
     pub listen: String,
     /// Bearer tokens accepted by the REST API.
-    pub tokens: Vec<String>,
+    pub tokens: Vec<ApiToken>,
 }
 
 impl Default for ApiConfig {
@@ -102,8 +112,10 @@ pub struct DeliveryConfig {
     pub relay: Option<String>,
     /// Optional username for relay authentication.
     pub relay_username: Option<String>,
-    /// Optional password for relay authentication.
-    pub relay_password: Option<String>,
+    /// Optional password for relay authentication. Only `literal:` is valid
+    /// here: the password must be sent to the remote relay, so an Argon2
+    /// hash (which cannot be reversed) is rejected at load time.
+    pub relay_password: Option<Secret>,
     /// TLS mode for the relay: "auto", "starttls", "tls" or "plain".
     /// "auto" uses implicit TLS for port 465 and STARTTLS elsewhere,
     /// falling back to plaintext when STARTTLS is not advertised.
@@ -194,6 +206,7 @@ impl Config {
             }
         };
         config.resolve_paths(dir);
+        config.validate()?;
         Ok(config)
     }
 
@@ -246,7 +259,21 @@ impl Config {
         };
 
         config.resolve_paths_merged(user_dir, system_dir);
+        config.validate()?;
         Ok(config)
+    }
+
+    /// Reject semantically invalid credential combinations.
+    fn validate(&self) -> Result<()> {
+        if matches!(&self.delivery.relay_password, Some(Secret::Argon2(_))) {
+            return Err(Error::Config(
+                "delivery.relay_password cannot use \"argon2:\": the password must be \
+                 sent to the remote relay and therefore has to be recoverable; \
+                 use \"literal:\""
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Resolve TLS certificate paths from the config dir when not set.
@@ -373,16 +400,23 @@ listen = "0.0.0.0:2525"
 
 [[smtp.users]]
 username = "app"
-password = "hunter2"
+password = "literal:hunter2"
 
 [api]
 enabled = true
-tokens = ["tok-1", "tok-2"]
+
+[[api.tokens]]
+name = "ci"
+token = "literal:tok-1"
+
+[[api.tokens]]
+name = "deploy"
+token = "literal:tok-2"
 
 [delivery]
 relay = "smtp.provider.com:587"
 relay_username = "u"
-relay_password = "p"
+relay_password = "literal:p"
 
 [retry]
 max_attempts = 3
@@ -399,17 +433,61 @@ backoff_factor = 3
         assert_eq!(config.smtp.listen, "0.0.0.0:2525");
         assert_eq!(config.smtp.users.len(), 1);
         assert_eq!(config.smtp.users[0].username, "app");
-        assert!(config.api.enabled);
         assert_eq!(
-            config.api.tokens,
-            vec!["tok-1".to_string(), "tok-2".to_string()]
+            config.smtp.users[0].password,
+            crate::secret::Secret::Literal("hunter2".into())
         );
+        assert!(config.api.enabled);
+        assert_eq!(config.api.tokens.len(), 2);
+        assert_eq!(config.api.tokens[0].name, "ci");
+        assert_eq!(
+            config.api.tokens[0].token,
+            crate::secret::Secret::Literal("tok-1".into())
+        );
+        assert_eq!(config.api.tokens[1].name, "deploy");
         assert_eq!(
             config.delivery.relay.as_deref(),
             Some("smtp.provider.com:587")
         );
         assert_eq!(config.retry.max_attempts, 3);
         assert_eq!(config.retry.backoff_factor, 3);
+    }
+
+    #[test]
+    fn rejects_unprefixed_password() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            r#"
+[smtp]
+enabled = true
+
+[[smtp.users]]
+username = "app"
+password = "hunter2"
+"#,
+        )
+        .unwrap();
+        let err = Config::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("literal:"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rejects_argon2_relay_password() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            r#"
+[delivery]
+relay = "smtp.provider.com:587"
+relay_username = "u"
+relay_password = "argon2:$argon2id$v=19$m=1024,t=1,p=1$c2FsdA$aGFzaA"
+"#,
+        )
+        .unwrap();
+        let err = Config::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("relay_password"), "unexpected error: {err}");
+        assert!(err.contains("literal:"), "unexpected error: {err}");
     }
 
     #[test]

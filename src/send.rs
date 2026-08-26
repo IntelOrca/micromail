@@ -76,12 +76,27 @@ impl Delivery {
             Some(addr) => {
                 let (host, port) = parse_host_port(addr)
                     .ok_or_else(|| Error::Config(format!("invalid delivery.relay {addr:?}")))?;
+                let password = match &config.delivery.relay_password {
+                    None => None,
+                    // Guarded by Config::validate; error rather than
+                    // silently skipping relay authentication.
+                    Some(secret) => match secret.literal() {
+                        Some(pw) => Some(pw.to_string()),
+                        None => {
+                            return Err(Error::Config(
+                                "delivery.relay_password cannot use \"argon2:\": the password \
+                                 must be sent to the remote relay; use \"literal:\""
+                                    .into(),
+                            ));
+                        }
+                    },
+                };
                 Some(Relay {
                     host,
                     port,
                     tls: TlsMode::from_str(&config.delivery.relay_tls)?,
                     username: config.delivery.relay_username.clone(),
-                    password: config.delivery.relay_password.clone(),
+                    password,
                 })
             }
             None => None,

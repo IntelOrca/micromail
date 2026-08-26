@@ -13,23 +13,33 @@ listen = "0.0.0.0:587"       # plain + STARTTLS
 tls_listen = "0.0.0.0:465"   # implicit TLS, only when cert+key present
 # cert = "~/.config/micromail/tls/cert.pem"  # auto: <config>/tls/cert.pem (user > system)
 # key  = "~/.config/micromail/tls/key.pem"   # auto: <config>/tls/key.pem
+# Credentials must carry a storage scheme prefix:
+#   literal:<plaintext>   plaintext secret (compared in constant time)
+#   argon2:<PHC string>   Argon2 hash, e.g. argon2:$argon2id$v=19$m=19456,t=2,p=1$...
+#                         generate one with:
+#                         echo -n "change-me" | argon2 "$(head -c 16 /dev/urandom | base64)" -id -t 2 -m 14 -p 1 -e
 [[smtp.users]]
 username = "app"
-password = "change-me"
+password = "literal:change-me"
+# password = "argon2:$argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>"
 # allow_auth_insecure = false   # when true, AUTH is accepted on plaintext
                                  # connections (credentials sent unencrypted).
                                  # Default false: AUTH requires STARTTLS/TLS.
+# Usernames are matched ASCII case-insensitively; passwords exactly.
 # Note: authenticated users may send with any From address; only add trusted users.
 
 [api]
 enabled = true
 listen = "0.0.0.0:8080"
-tokens = ["change-me-token"]
+# Bearer tokens accepted by POST /send; `name` identifies the holder.
+[[api.tokens]]
+name = "ci-server"
+token = "literal:change-me-token"
 
 [delivery]
 # relay = "smtp.provider.com:587"  # when unset: direct MX to recipient domain
 # relay_username = "u"
-# relay_password = "p"
+# relay_password = "literal:p"     # literal only: sent to the remote relay
 relay_tls = "auto"           # auto, starttls, tls, plain
 timeout_secs = 30            # default 300; 30 suits direct-MX smoke tests
 
