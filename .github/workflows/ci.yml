@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
   workflow_call:
 
@@ -38,5 +38,40 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           path: micromail-x86_64-linux
+          archive: false
+          if-no-files-found: error
+
+  test-windows:
+    name: Format, clippy, test (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Stage binary
+        shell: bash
+        run: cp target/release/micromail.exe micromail-x86_64-windows.exe
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: micromail-x86_64-windows.exe
           archive: false
           if-no-files-found: error
