@@ -93,10 +93,20 @@ jobs:
           merge-multiple: true
           path: dist
 
+      - name: Extract tag message for release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          TAG_OBJECT=$(gh api "repos/${{ github.repository }}/git/refs/tags/${{ github.ref_name }}" --jq '.object.sha')
+          gh api "repos/${{ github.repository }}/git/tags/$TAG_OBJECT" --jq '.message' > release-notes.md
+          echo "Notes extracted from tag ${{ github.ref_name }} ($(wc -l < release-notes.md) lines)"
+
       - name: Publish release
         uses: softprops/action-gh-release@v3
         with:
           files: dist/*
+          body_path: release-notes.md
           # Release body comes from the annotated tag message (no GitHub auto notes).
           generate_release_notes: false
           fail_on_unmatched_files: true
