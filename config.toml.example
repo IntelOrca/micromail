@@ -18,6 +18,9 @@ tls_listen = "0.0.0.0:465"   # implicit TLS, only when cert+key present
 #   argon2:<PHC string>   Argon2 hash, e.g. argon2:$argon2id$v=19$m=19456,t=2,p=1$...
 #                         generate one with:
 #                         echo -n "change-me" | argon2 "$(head -c 16 /dev/urandom | base64)" -id -t 2 -m 14 -p 1 -e
+#                         or use the CLI, which hashes automatically:
+#                         micromail user add app     (prompts; stores argon2:)
+#                         micromail token add ci --generate   (random token, shown once)
 [[smtp.users]]
 username = "app"
 password = "literal:change-me"

@@ -30,13 +30,23 @@ async fn run() -> Result<()> {
         .config
         .clone()
         .unwrap_or_else(micromail::config::default_config_dir);
-    let config = Config::load(&config_dir)?;
-
-    init_tracing(&config, cli.verbose);
 
     match cli.command.unwrap_or(Command::Serve) {
-        Command::Serve => serve(config, config_dir).await,
-        Command::Send(args) => send(*args, config, &config_dir).await,
+        Command::Serve => {
+            let config = Config::load(&config_dir)?;
+            init_tracing(&config, cli.verbose);
+            serve(config, config_dir).await
+        }
+        Command::Send(args) => {
+            let config = Config::load(&config_dir)?;
+            init_tracing(&config, cli.verbose);
+            send(*args, config, &config_dir).await
+        }
+        // Management commands parse config.toml themselves so they can run
+        // (and repair) even when the current config is invalid.
+        Command::Config(args) => micromail::manage::config_command(args.command, &config_dir),
+        Command::User(args) => micromail::manage::user_command(args.command, &config_dir),
+        Command::Token(args) => micromail::manage::token_command(args.command, &config_dir),
     }
 }
 

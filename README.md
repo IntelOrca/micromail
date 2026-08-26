@@ -25,6 +25,7 @@ No daemons-of-daemons, no databases: one binary, one TOML file.
 - **SMTP submission server** — port 587 (STARTTLS) and 465 (implicit TLS), AUTH PLAIN/LOGIN
 - **REST API** — `POST /send` with bearer-token auth, `GET /health`
 - **CLI sender** — one-shot synchronous sends from scripts and cron jobs
+- **CLI config management** — get/set settings, add/remove SMTP users and API tokens, with credentials stored as Argon2 hashes
 - **DKIM signing** — RSA (2048+) and Ed25519 keys, multiple selectors for rotation
 - **Direct MX delivery** — resolves recipient MX records itself; or relay through any provider
 - **Persistent spool** — atomic writes, retry with exponential backoff, dead-letter folder
@@ -233,7 +234,10 @@ token = "literal:change-me-token"
 ```
 
 Generate an Argon2id PHC string with any standard tool, e.g.
-`echo -n "change-me" | argon2 "$(head -c 16 /dev/urandom | base64)" -id -t 2 -m 14 -p 1 -e`.
+`echo -n "change-me" | argon2 "$(head -c 16 /dev/urandom | base64)" -id -t 2 -m 14 -p 1 -e`,
+or simply let micromail do it for you:
+`micromail user add app` and `micromail token add ci --generate` hash the secret
+with Argon2id automatically.
 
 Unprefixed values are rejected at startup. `delivery.relay_password` accepts
 `literal:` only — the plaintext is required to authenticate against the remote relay.
@@ -252,6 +256,51 @@ secrets for high-throughput endpoints.
   (blocked on many clouds), plus proper SPF/PTR/`hostname` DNS for good deliverability.
 - **Relay** — set `[delivery] relay = "smtp.provider.com:587"` (+ credentials) and everything
   is handed to your provider instead.
+
+## Managing config, users and tokens
+
+The config can be edited by hand, but micromail also ships CLI commands for the common
+operations. They write to the selected config directory (`-c <dir>`, otherwise
+`~/.config/micromail`), keep existing comments and formatting, and write the file
+atomically.
+
+Get and set individual settings — dotted key paths; `config get` shows the effective
+value from the merged config and redacts secrets:
+
+```bash
+micromail config get smtp.listen
+micromail config get delivery.relay_password   # → **redacted**
+micromail config set hostname mail.example.com
+micromail config set smtp.enabled true
+micromail config set retry.max_attempts 7
+```
+
+SMTP users — the password is prompted for (hidden), hashed with Argon2id and stored as
+`argon2:<PHC>`. Supply it non-interactively with `--password`, `--password-stdin` or
+`--password-file`; add `--literal` to store plaintext instead:
+
+```bash
+micromail user add app
+micromail user passwd app
+micromail user remove app
+micromail user list
+```
+
+API tokens — `--generate` mints a cryptographically random bearer token, prints it
+exactly once, and stores only its Argon2 hash:
+
+```bash
+micromail token add ci --generate
+micromail token rotate ci --generate
+micromail token remove ci
+micromail token list
+```
+
+Usernames match ASCII case-insensitively (like SMTP AUTH); token names are
+case-sensitive (like the REST API). The write commands (`config set`,
+`user ...`, `token ...`) run even when `config.toml` is currently invalid, so
+they can repair a broken file; the read commands (`config get`, `user list`,
+`token list`) require a valid config.
 
 ## Development
 

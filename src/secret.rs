@@ -1,12 +1,46 @@
 use crate::error::{Error, Result};
-use argon2::password_hash::{PasswordHash, PasswordVerifier};
+use argon2::password_hash::rand_core::{OsRng, RngCore};
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
 const PREFIX_LITERAL: &str = "literal:";
 const PREFIX_ARGON2: &str = "argon2:";
+
+/// Number of random bytes behind a generated API token.
+const GENERATED_TOKEN_BYTES: usize = 32;
+
+/// Hash a plaintext secret with Argon2id (default parameters, random salt)
+/// and return the PHC-formatted hash string for storage as `argon2:<PHC>`.
+pub fn hash(plain: &str) -> Result<String> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(plain.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|e| Error::Config(format!("failed to hash secret: {e}")))
+}
+
+/// Build the config value for a hashed secret: `argon2:<PHC string>`.
+pub fn argon2_value(plain: &str) -> Result<String> {
+    Ok(format!("{PREFIX_ARGON2}{}", hash(plain)?))
+}
+
+/// Build the config value for a literal secret: `literal:<plaintext>`.
+pub fn literal_value(plain: &str) -> String {
+    format!("{PREFIX_LITERAL}{plain}")
+}
+
+/// Generate a cryptographically random, URL-safe bearer token
+/// (43 characters from 32 bytes of OS entropy).
+pub fn generate_token() -> String {
+    let mut bytes = [0u8; GENERATED_TOKEN_BYTES];
+    OsRng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
 
 /// A configured credential with an explicit storage scheme prefix.
 ///
@@ -64,6 +98,14 @@ impl Secret {
         match self {
             Secret::Literal(value) => Some(value),
             Secret::Argon2(_) => None,
+        }
+    }
+
+    /// The storage scheme of this secret: `"literal"` or `"argon2"`.
+    pub fn scheme(&self) -> &'static str {
+        match self {
+            Secret::Literal(_) => "literal",
+            Secret::Argon2(_) => "argon2",
         }
     }
 }
@@ -214,7 +256,10 @@ mod tests {
     fn debug_output_is_redacted() {
         let literal = Secret::parse("literal:hunter2").unwrap();
         let rendered = format!("{literal:?}");
-        assert!(!rendered.contains("hunter2"), "leaked via Debug: {rendered}");
+        assert!(
+            !rendered.contains("hunter2"),
+            "leaked via Debug: {rendered}"
+        );
         assert!(rendered.contains("redacted"));
 
         let argon2 = Secret::parse("argon2:$argon2id$v=19$m=1024,t=1,p=1$s$abc").unwrap();
@@ -228,5 +273,47 @@ mod tests {
         assert_eq!(encoded.as_str(), Some("literal:hunter2"));
         let decoded: Secret = encoded.try_into().unwrap();
         assert_eq!(decoded, literal);
+    }
+
+    #[test]
+    fn hash_produces_verifiable_argon2() {
+        let raw = hash("hunter2").unwrap();
+        assert!(raw.starts_with("$argon2id$"), "{raw}");
+        let secret = Secret::parse(&format!("argon2:{raw}")).unwrap();
+        assert_eq!(secret.scheme(), "argon2");
+        assert!(secret.verify("hunter2"));
+        assert!(!secret.verify("wrong"));
+        // A fresh salt must be used each time.
+        assert_ne!(hash("hunter2").unwrap(), raw);
+    }
+
+    #[test]
+    fn hash_is_unique_per_call() {
+        let a = hash("same").unwrap();
+        let b = hash("same").unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn prefixed_value_builders() {
+        assert_eq!(literal_value("pa:ss"), "literal:pa:ss");
+        let hashed = argon2_value("hunter2").unwrap();
+        assert!(hashed.starts_with("argon2:$argon2id$"), "{hashed}");
+    }
+
+    #[test]
+    fn generated_tokens_are_url_safe_and_unique() {
+        let first = generate_token();
+        let second = generate_token();
+        assert_eq!(first.len(), 43);
+        assert_ne!(first, second);
+        for token in [&first, &second] {
+            assert!(
+                token
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+                "{token}"
+            );
+        }
     }
 }

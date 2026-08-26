@@ -24,6 +24,7 @@ hickory-resolver = { version = "0.26.1", features = ["tokio"] }
 mail-builder = "0.4.4"
 mail-parser = "0.11.6"
 mail-send = { version = "0.6.1", default-features = false, features = ["builder"] }
+rpassword = "7.5.4"
 rsa = "0.9.10"
 rustls = "0.23.43"
 rustls-pemfile = "2.2.0"
@@ -35,6 +36,7 @@ sha2 = "0.10"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "io-util", "io-std", "time", "sync", "macros", "fs", "process", "signal"], default-features = false }
 tokio-rustls = "0.26.4"
 toml = "1.1.4"
+toml_edit = "0.25.13"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.24.0", features = ["v4"] }

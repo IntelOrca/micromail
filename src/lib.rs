@@ -3,6 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod dkim;
 pub mod error;
+pub mod manage;
 pub mod message;
 pub mod queue;
 pub mod secret;

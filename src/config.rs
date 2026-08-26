@@ -264,7 +264,7 @@ impl Config {
     }
 
     /// Reject semantically invalid credential combinations.
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if matches!(&self.delivery.relay_password, Some(Secret::Argon2(_))) {
             return Err(Error::Config(
                 "delivery.relay_password cannot use \"argon2:\": the password must be \
