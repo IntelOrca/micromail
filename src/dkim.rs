@@ -608,25 +608,29 @@ impl DkimManager {
     /// message being signed). Selects selector via default_selector if present,
     /// else if exactly one selector exists uses it, otherwise fails.
     pub fn build_signer(&self, domain: &str, headers: &[&str]) -> Result<DkimSigner> {
-        let inner = self
-            .entries
-            .get(domain)
-            .ok_or_else(|| Error::Dkim(format!("no DKIM key for domain {domain}")))?;
-        if inner.is_empty() {
-            return Err(Error::Dkim(format!("no DKIM key for domain {domain}")));
-        }
-        let entry = if let Some(e) = inner.get(&self.default_selector) {
-            e
-        } else if inner.len() == 1 {
-            inner.values().next().unwrap()
-        } else {
-            let mut selectors: Vec<String> = inner.keys().cloned().collect();
-            selectors.sort();
-            return Err(Error::Dkim(format!(
-                "multiple DKIM keys for domain {domain} ({}) but none matches default selector {:?}; set dkim_selector_default or keep only one",
-                selectors.join(", "),
-                self.default_selector
-            )));
+        let entry = match self.entries.get(domain) {
+            None => return Err(Error::Dkim(format!("no DKIM key for domain {domain}"))),
+            Some(inner) => {
+                if let Some(e) = inner.get(&self.default_selector).or_else(|| {
+                    if inner.len() == 1 {
+                        inner.values().next()
+                    } else {
+                        None
+                    }
+                }) {
+                    e
+                } else if inner.is_empty() {
+                    return Err(Error::Dkim(format!("no DKIM key for domain {domain}")));
+                } else {
+                    let mut selectors: Vec<String> = inner.keys().cloned().collect();
+                    selectors.sort();
+                    return Err(Error::Dkim(format!(
+                        "multiple DKIM keys for domain {domain} ({}) but none matches default selector {:?}; set dkim_selector_default or keep only one",
+                        selectors.join(", "),
+                        self.default_selector
+                    )));
+                }
+            }
         };
 
         // Decide algorithm based on key type; default RSA->Sha256, Ed25519->Sha256

@@ -29,20 +29,9 @@ pub struct SmtpServer {
 
 impl SmtpServer {
     pub fn new(config: Arc<Config>, spool: Arc<Spool>) -> Result<Self> {
-        let tls = if config.smtp_tls_enabled() {
-            let cert = config
-                .smtp
-                .cert
-                .as_ref()
-                .expect("cert checked by smtp_tls_enabled");
-            let key = config
-                .smtp
-                .key
-                .as_ref()
-                .expect("key checked by smtp_tls_enabled");
-            Some(Arc::new(load_tls_acceptor(cert, key)?))
-        } else {
-            None
+        let tls = match config.smtp_tls_paths() {
+            Some((cert, key)) => Some(Arc::new(load_tls_acceptor(cert, key)?)),
+            None => None,
         };
         Ok(SmtpServer { config, spool, tls })
     }

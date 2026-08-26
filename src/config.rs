@@ -316,7 +316,15 @@ impl Config {
 
     /// True when the SMTP submission server should present TLS.
     pub fn smtp_tls_enabled(&self) -> bool {
-        self.smtp.cert.is_some() && self.smtp.key.is_some()
+        self.smtp_tls_paths().is_some()
+    }
+
+    /// Certificate and key paths when both are configured, `None` otherwise.
+    pub fn smtp_tls_paths(&self) -> Option<(&Path, &Path)> {
+        match (&self.smtp.cert, &self.smtp.key) {
+            (Some(cert), Some(key)) => Some((cert.as_path(), key.as_path())),
+            _ => None,
+        }
     }
 
     /// Directory holding per-domain DKIM keys: `<config dir>/dkim`.
