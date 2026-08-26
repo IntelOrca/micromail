@@ -764,6 +764,8 @@ ccRqGWFXwwPUPeTFHVTFnLE=
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
         }
+        #[cfg(not(unix))]
+        let _ = mode;
     }
 
     fn key_dir() -> (tempfile::TempDir, PathBuf) {
