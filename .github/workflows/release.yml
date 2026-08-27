@@ -48,6 +48,45 @@ jobs:
           archive: false
           if-no-files-found: error
 
+  build-musl:
+    name: Build x86_64 musl (Alpine)
+    runs-on: ubuntu-latest
+    needs: ci
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Sync version from tag
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+          grep '^version = ' Cargo.toml
+
+      - name: Build static release binary
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          cp "target/x86_64-unknown-linux-musl/release/${BIN}" "${BIN}-${VERSION}-x86_64-musl"
+          chmod +x "${BIN}-${VERSION}-x86_64-musl"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          path: micromail-*-x86_64-musl
+          archive: false
+          if-no-files-found: error
+
   build-windows:
     name: Build x86_64 Windows
     runs-on: windows-latest
@@ -84,7 +123,7 @@ jobs:
   release:
     name: Create GitHub release
     runs-on: ubuntu-latest
-    needs: [build-linux, build-windows]
+    needs: [build-linux, build-musl, build-windows]
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v8

@@ -41,6 +41,35 @@ jobs:
           archive: false
           if-no-files-found: error
 
+  test-musl:
+    name: Build static musl (Alpine) binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build static release binary
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Stage binary
+        shell: bash
+        run: cp target/x86_64-unknown-linux-musl/release/micromail micromail-x86_64-musl
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: micromail-x86_64-musl
+          archive: false
+          if-no-files-found: error
+
   test-windows:
     name: Format, clippy, test (Windows)
     runs-on: windows-latest
