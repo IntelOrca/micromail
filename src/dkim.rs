@@ -89,9 +89,8 @@ pub fn generate_key(kind: KeyKind, bits: u32) -> Result<(PrivateKey, String)> {
                     "RSA DKIM key must be at least 1024 bits".into(),
                 ));
             }
-            let key = RsaPrivateKey::new(&mut rand::thread_rng(), bits as usize).map_err(|e| {
-                Error::Dkim(format!("RSA key generation failed: {e}"))
-            })?;
+            let key = RsaPrivateKey::new(&mut rand::thread_rng(), bits as usize)
+                .map_err(|e| Error::Dkim(format!("RSA key generation failed: {e}")))?;
             use rsa::pkcs8::EncodePrivateKey;
             let pem = key
                 .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)

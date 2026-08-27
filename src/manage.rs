@@ -6,7 +6,10 @@
 //! deserializing the edited document back into [`Config`] before it is
 //! written atomically.
 
-use crate::cli::{ConfigCommand, DkimCommand, DkimKeyAlgorithm, DnsCommand, SecretSource, TokenCommand, UserCommand};
+use crate::cli::{
+    ConfigCommand, DkimCommand, DkimKeyAlgorithm, DnsCommand, SecretSource, TokenCommand,
+    UserCommand,
+};
 use crate::config::{Config, SYSTEM_CONFIG_DIR};
 use crate::dkim::{self, KeyKind};
 use crate::dns::{self, DnsFormat};
@@ -189,7 +192,10 @@ fn sync_default_selector(config_dir: &Path, selector: &str) -> Result<()> {
                 eprintln!("warning: could not write {}: {e}", path.display());
                 return Ok(());
             }
-            println!("set dkim_selector_default = {selector:?} in {}", path.display());
+            println!(
+                "set dkim_selector_default = {selector:?} in {}",
+                path.display()
+            );
         }
         Some(item) => {
             if let Some(existing) = item.as_str() {
@@ -243,7 +249,11 @@ fn dns_spf(
 }
 
 fn validate_domain(domain: &str) -> Result<()> {
-    if domain.is_empty() || domain.chars().any(|c| c.is_whitespace() || c == '/' || c == '\\') {
+    if domain.is_empty()
+        || domain
+            .chars()
+            .any(|c| c.is_whitespace() || c == '/' || c == '\\')
+    {
         return Err(Error::InvalidInput(
             "domain must be non-empty and contain no whitespace or path separators".into(),
         ));

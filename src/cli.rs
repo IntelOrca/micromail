@@ -566,9 +566,7 @@ mod tests {
         match cli.command.unwrap() {
             Command::Dns(args) => match args.command {
                 DnsCommand::Dkim {
-                    domain,
-                    selector,
-                    ..
+                    domain, selector, ..
                 } => {
                     assert_eq!(domain, "example.com");
                     assert_eq!(selector, "mail");

@@ -460,7 +460,8 @@ fn build_resolver() -> Result<hickory_resolver::TokioResolver> {
     // rustls 0.23 requires a process-wide crypto provider; hickory's resolver
     // depends on rustls. Install one on first use (idempotent — later calls
     // just hit the already-set default).
-    let _ = rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
     hickory_resolver::TokioResolver::builder_tokio()
         .map_err(|e| Error::Dns(e.to_string()))?
         .build()
