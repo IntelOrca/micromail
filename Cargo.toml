@@ -30,7 +30,7 @@ rand = "0.8"
 pkcs8_11 = { package = "pkcs8", version = "0.11", features = ["pem"] }
 rpassword = "7.5.4"
 rsa = "0.9.10"
-rustls = "0.23.43"
+rustls = { version = "0.23.43", features = ["ring"] }
 rustls-pemfile = "2.2.0"
 rustls-pki-types = "1.15.1"
 serde = { version = "1.0.229", features = ["derive"] }
