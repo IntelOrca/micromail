@@ -2,6 +2,7 @@ pub mod api;
 pub mod cli;
 pub mod config;
 pub mod dkim;
+pub mod dns;
 pub mod error;
 pub mod manage;
 pub mod message;

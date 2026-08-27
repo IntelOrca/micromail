@@ -47,6 +47,8 @@ async fn run() -> Result<()> {
         Command::Config(args) => micromail::manage::config_command(args.command, &config_dir),
         Command::User(args) => micromail::manage::user_command(args.command, &config_dir),
         Command::Token(args) => micromail::manage::token_command(args.command, &config_dir),
+        Command::Dkim(args) => micromail::manage::dkim_command(args.command, &config_dir),
+        Command::Dns(args) => micromail::manage::dns_command(args.command, &config_dir),
     }
 }
 

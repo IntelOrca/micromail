@@ -19,11 +19,15 @@ axum = "0.8.9"
 base64 = "0.23.1"
 clap = { version = "4.6.6", features = ["derive"] }
 dirs = "5.0.1"
-ed25519-dalek = { version = "3.0.0", features = ["pkcs8"] }
+ed25519-dalek = { version = "3.0.0", features = ["pkcs8", "alloc"] }
 hickory-resolver = { version = "0.26.1", features = ["tokio"] }
 mail-builder = "0.4.4"
 mail-parser = "0.11.6"
 mail-send = { version = "0.6.1", default-features = false, features = ["builder"] }
+rand = "0.8"
+# Renamed so we can enable the `pem` feature on the pkcs8 0.11 that
+# ed25519-dalek uses (to emit PKCS#8 PEM for generated Ed25519 keys).
+pkcs8_11 = { package = "pkcs8", version = "0.11", features = ["pem"] }
 rpassword = "7.5.4"
 rsa = "0.9.10"
 rustls = "0.23.43"
@@ -34,6 +38,7 @@ serde_json = "1.0.151"
 sha1 = "0.10"
 sha2 = "0.10"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "io-util", "io-std", "time", "sync", "macros", "fs", "process", "signal"], default-features = false }
+ureq = { version = "2.12", default-features = false, features = ["tls", "gzip"] }
 tokio-rustls = "0.26.4"
 toml = "1.1.4"
 toml_edit = "0.25.13"
@@ -42,7 +47,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.24.0", features = ["v4"] }
 
 [dev-dependencies]
-rand = "0.8"
 rcgen = "0.14.9"
 tempfile = "3.27.0"
 tower = { version = "0.5", features = ["util"] }

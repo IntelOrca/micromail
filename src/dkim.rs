@@ -71,6 +71,68 @@ impl DkimAlgorithm {
     }
 }
 
+/// Key type produced by [`generate_key`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyKind {
+    Rsa,
+    Ed25519,
+}
+
+/// Generate a fresh DKIM signing key of `kind`. For RSA, `bits` is the key
+/// size (ignored for Ed25519). Returns the in-memory key plus its PEM encoding,
+/// suitable for writing to `<config dir>/dkim/<domain>/<selector>`.
+pub fn generate_key(kind: KeyKind, bits: u32) -> Result<(PrivateKey, String)> {
+    match kind {
+        KeyKind::Rsa => {
+            if bits < 1024 {
+                return Err(Error::InvalidInput(
+                    "RSA DKIM key must be at least 1024 bits".into(),
+                ));
+            }
+            let key = RsaPrivateKey::new(&mut rand::thread_rng(), bits as usize).map_err(|e| {
+                Error::Dkim(format!("RSA key generation failed: {e}"))
+            })?;
+            use rsa::pkcs8::EncodePrivateKey;
+            let pem = key
+                .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+                .map_err(|e| Error::Dkim(format!("export RSA private key: {e}")))?;
+            Ok((PrivateKey::Rsa(key), pem.to_string()))
+        }
+        KeyKind::Ed25519 => {
+            use rand::RngCore;
+            let mut bytes = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut bytes);
+            let key = ed25519_dalek::SigningKey::from_bytes(&bytes);
+            use pkcs8_11::{EncodePrivateKey, LineEnding};
+            let pem = key
+                .to_pkcs8_pem(LineEnding::LF)
+                .map_err(|e| Error::Dkim(format!("export Ed25519 private key: {e}")))?;
+            Ok((PrivateKey::Ed25519(key), pem.to_string()))
+        }
+    }
+}
+
+/// Build the DKIM TXT record value (`v=DKIM1; k=...; p=...`) for a key.
+/// `p=` is the base64 of the SubjectPublicKeyInfo DER for RSA, or the raw
+/// 32-byte public key for Ed25519, matching what receivers expect.
+pub fn public_key_dns(_domain: &str, _selector: &str, key: &PrivateKey) -> Result<String> {
+    let (k, p) = match key {
+        PrivateKey::Rsa(k) => {
+            use rsa::pkcs1::EncodeRsaPublicKey;
+            let der = k
+                .to_public_key()
+                .to_pkcs1_der()
+                .map_err(|e| Error::Dkim(format!("export RSA public key: {e}")))?;
+            ("rsa", BASE64.encode(der.as_bytes()))
+        }
+        PrivateKey::Ed25519(k) => {
+            let raw = k.verifying_key().to_bytes();
+            ("ed25519", BASE64.encode(raw))
+        }
+    };
+    Ok(format!("v=DKIM1; k={k}; p={p}"))
+}
+
 pub struct DkimSigner {
     pub domain: String,
     pub selector: String,
@@ -663,7 +725,8 @@ impl DkimManager {
     }
 }
 
-fn is_valid_selector(s: &str) -> bool {
+/// True when `s` is a valid DKIM selector name (`[A-Za-z0-9_-]`, 1..63).
+pub fn is_valid_selector(s: &str) -> bool {
     if s.is_empty() || s.len() > 63 {
         return false;
     }
@@ -673,7 +736,7 @@ fn is_valid_selector(s: &str) -> bool {
 
 /// Parse a PEM private key into a DKIM signing key, accepting RSA (PKCS1 or
 /// PKCS8) and Ed25519 (PKCS8). Allows 1024-bit RSA.
-fn parse_key(pem: &[u8]) -> Result<PrivateKey> {
+pub fn parse_key(pem: &[u8]) -> Result<PrivateKey> {
     let der = PrivateKeyDer::from_pem_slice(pem)
         .map_err(|e| Error::Dkim(format!("cannot parse private key PEM: {e}")))?;
     match der {

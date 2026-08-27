@@ -6,8 +6,10 @@
 //! deserializing the edited document back into [`Config`] before it is
 //! written atomically.
 
-use crate::cli::{ConfigCommand, SecretSource, TokenCommand, UserCommand};
+use crate::cli::{ConfigCommand, DkimCommand, DkimKeyAlgorithm, DnsCommand, SecretSource, TokenCommand, UserCommand};
 use crate::config::{Config, SYSTEM_CONFIG_DIR};
+use crate::dkim::{self, KeyKind};
+use crate::dns::{self, DnsFormat};
 use crate::error::{Error, Result};
 use crate::secret;
 use std::io::Read as _;
@@ -51,6 +53,202 @@ pub fn token_command(command: TokenCommand, config_dir: &Path) -> Result<()> {
         }
         TokenCommand::Remove { name } => remove_token(config_dir, &name),
     }
+}
+
+/// Entry point for `micromail dkim ...`.
+pub fn dkim_command(command: DkimCommand, config_dir: &Path) -> Result<()> {
+    match command {
+        DkimCommand::Generate {
+            domain,
+            selector,
+            algorithm,
+            bits,
+            force,
+        } => generate_dkim(config_dir, &domain, &selector, algorithm, bits, force),
+    }
+}
+
+/// Entry point for `micromail dns ...`.
+pub fn dns_command(command: DnsCommand, config_dir: &Path) -> Result<()> {
+    match command {
+        DnsCommand::Dkim {
+            domain,
+            selector,
+            format,
+        } => dns_dkim(config_dir, &domain, &selector, format),
+        DnsCommand::Spf {
+            domain,
+            ip,
+            include,
+            auto_ip,
+            hostname,
+            format,
+        } => dns_spf(
+            config_dir,
+            &domain,
+            &ip,
+            &include,
+            auto_ip,
+            hostname.as_deref(),
+            format,
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------
+// dkim generate
+// ---------------------------------------------------------------------
+
+fn generate_dkim(
+    config_dir: &Path,
+    domain: &str,
+    selector: &str,
+    algorithm: DkimKeyAlgorithm,
+    bits: u32,
+    force: bool,
+) -> Result<()> {
+    validate_domain(domain)?;
+    if !dkim::is_valid_selector(selector) {
+        return Err(Error::InvalidInput(format!(
+            "selector {selector:?} is invalid; use 1-63 characters of A-Z, a-z, 0-9, '-' or '_'"
+        )));
+    }
+    let kind = match algorithm {
+        DkimKeyAlgorithm::Rsa => KeyKind::Rsa,
+        DkimKeyAlgorithm::Ed25519 => KeyKind::Ed25519,
+    };
+    let (key, pem) = dkim::generate_key(kind, bits)?;
+
+    let dir = config_dir.join("dkim").join(domain);
+    std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let path = dir.join(selector);
+    if path.exists() && !force {
+        return Err(Error::InvalidInput(format!(
+            "DKIM key {domain}/{selector} already exists at {}; use --force to overwrite",
+            path.display()
+        )));
+    }
+    write_secret_file(&path, pem.as_bytes())?;
+
+    sync_default_selector(config_dir, selector)?;
+
+    let value = dkim::public_key_dns(domain, selector, &key)?;
+    let name = format!("_{selector}._domainkey.{domain}");
+    println!("DKIM private key written to {}", path.display());
+    print!("{}", dns::render_record(&name, &value, DnsFormat::Human));
+    Ok(())
+}
+
+/// Write `contents` to `path` (creating parents) with 0o600 perms so the DKIM
+/// loader accepts it (it rejects group/other-readable keys).
+fn write_secret_file(path: &Path, contents: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(path, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// Keep the runtime's `dkim_selector_default` consistent with the generated
+/// key so the daemon signs with the same selector published in DNS. Best
+/// effort: failures only warn rather than abort key generation.
+fn sync_default_selector(config_dir: &Path, selector: &str) -> Result<()> {
+    let path = config_file_path(config_dir);
+    let mut document = match load_document(&path) {
+        Ok(doc) => doc,
+        Err(_) => {
+            eprintln!(
+                "warning: could not read {} to set dkim_selector_default; the daemon will \
+                 sign with its configured selector. Set it with `micromail config set \
+                 dkim_selector_default {selector}`",
+                path.display()
+            );
+            return Ok(());
+        }
+    };
+    match document.get("dkim_selector_default") {
+        None => {
+            document.insert("dkim_selector_default", value(selector));
+            if let Err(e) = validate_document(&path, &document) {
+                eprintln!("warning: could not update {}: {e}", path.display());
+                return Ok(());
+            }
+            if let Err(e) = save_document(&path, &document) {
+                eprintln!("warning: could not write {}: {e}", path.display());
+                return Ok(());
+            }
+            println!("set dkim_selector_default = {selector:?} in {}", path.display());
+        }
+        Some(item) => {
+            if let Some(existing) = item.as_str() {
+                if existing != selector {
+                    eprintln!(
+                        "warning: config dkim_selector_default = {existing:?} differs from the \
+                         generated selector {selector:?}; the daemon will sign with {existing:?}. \
+                         Run `micromail config set dkim_selector_default {selector}` to match."
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// dns
+// ---------------------------------------------------------------------
+
+fn dns_dkim(config_dir: &Path, domain: &str, selector: &str, format: DnsFormat) -> Result<()> {
+    let path = config_dir.join("dkim").join(domain).join(selector);
+    if !path.exists() {
+        return Err(Error::InvalidInput(format!(
+            "no DKIM key at {} (run `micromail dkim generate {domain} --selector {selector}` first)",
+            path.display()
+        )));
+    }
+    let pem = std::fs::read(&path)?;
+    let key = dkim::parse_key(&pem)?;
+    let value = dkim::public_key_dns(domain, selector, &key)?;
+    let name = format!("_{selector}._domainkey.{domain}");
+    print!("{}", dns::render_record(&name, &value, format));
+    Ok(())
+}
+
+fn dns_spf(
+    config_dir: &Path,
+    domain: &str,
+    ips: &[String],
+    includes: &[String],
+    auto_ip: bool,
+    hostname_override: Option<&str>,
+    format: DnsFormat,
+) -> Result<()> {
+    let config = Config::load(config_dir)?;
+    let hostname = hostname_override.unwrap_or(config.hostname.as_str());
+    let value = dns::build_spf(domain, hostname, ips, includes, auto_ip)?;
+    print!("{}", dns::render_record(domain, &value, format));
+    Ok(())
+}
+
+fn validate_domain(domain: &str) -> Result<()> {
+    if domain.is_empty() || domain.chars().any(|c| c.is_whitespace() || c == '/' || c == '\\') {
+        return Err(Error::InvalidInput(
+            "domain must be non-empty and contain no whitespace or path separators".into(),
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------
@@ -1090,5 +1288,145 @@ mod tests {
         assert!(!rendered.contains("literal:t"), "{rendered}");
         assert!(rendered.contains("**redacted**"), "{rendered}");
         assert!(rendered.contains("\"app\""), "{rendered}");
+    }
+
+    // ----- dkim generate / dns -----
+    #[test]
+    fn dkim_generate_writes_loadable_key() {
+        use crate::cli::{DkimCommand, DkimKeyAlgorithm};
+        use crate::dkim::DkimManager;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir();
+        dkim_command(
+            DkimCommand::Generate {
+                domain: "example.com".into(),
+                selector: "mail".into(),
+                algorithm: DkimKeyAlgorithm::Rsa,
+                bits: 2048,
+                force: false,
+            },
+            dir.path(),
+        )
+        .unwrap();
+
+        let path = dir.path().join("dkim/example.com/mail");
+        assert!(path.exists(), "key not written");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "key must be 0o600");
+
+        // The daemon must be able to load it under the default selector.
+        let manager = DkimManager::load(&dir.path().join("dkim"), "mail").unwrap();
+        assert!(manager.has_signer("example.com"));
+
+        // dns dkim must print the published record.
+        dns_command(
+            crate::cli::DnsCommand::Dkim {
+                domain: "example.com".into(),
+                selector: "mail".into(),
+                format: crate::dns::DnsFormat::Human,
+            },
+            dir.path(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn dkim_generate_refuses_existing_without_force() {
+        use crate::cli::DkimCommand;
+        let dir = temp_dir();
+        let build = || DkimCommand::Generate {
+            domain: "example.com".into(),
+            selector: "mail".into(),
+            algorithm: crate::cli::DkimKeyAlgorithm::Rsa,
+            bits: 2048,
+            force: false,
+        };
+        dkim_command(build(), dir.path()).unwrap();
+        let err = dkim_command(build(), dir.path()).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+
+        // --force overwrites.
+        dkim_command(
+            DkimCommand::Generate {
+                domain: "example.com".into(),
+                selector: "mail".into(),
+                algorithm: crate::cli::DkimKeyAlgorithm::Rsa,
+                bits: 2048,
+                force: true,
+            },
+            dir.path(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn dkim_generate_ed25519_roundtrips() {
+        use crate::dkim::parse_key;
+        let dir = temp_dir();
+        dkim_command(
+            crate::cli::DkimCommand::Generate {
+                domain: "example.com".into(),
+                selector: "mail".into(),
+                algorithm: crate::cli::DkimKeyAlgorithm::Ed25519,
+                bits: 2048,
+                force: false,
+            },
+            dir.path(),
+        )
+        .unwrap();
+        let pem = std::fs::read(dir.path().join("dkim/example.com/mail")).unwrap();
+        assert!(parse_key(&pem).is_ok());
+    }
+
+    #[test]
+    fn dkim_generate_rejects_invalid_selector() {
+        use crate::cli::DkimCommand;
+        let dir = temp_dir();
+        let err = dkim_command(
+            DkimCommand::Generate {
+                domain: "example.com".into(),
+                selector: "bad.selector".into(),
+                algorithm: crate::cli::DkimKeyAlgorithm::Rsa,
+                bits: 2048,
+                force: false,
+            },
+            dir.path(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid"), "{err}");
+        assert!(!dir.path().join("dkim/example.com").exists());
+    }
+
+    #[test]
+    fn dns_dkim_errors_when_key_missing() {
+        let dir = temp_dir();
+        let err = dns_command(
+            crate::cli::DnsCommand::Dkim {
+                domain: "nope.com".into(),
+                selector: "mail".into(),
+                format: crate::dns::DnsFormat::Human,
+            },
+            dir.path(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no DKIM key"), "{err}");
+    }
+
+    #[test]
+    fn dns_spf_renders_record() {
+        let dir = temp_dir();
+        dns_command(
+            crate::cli::DnsCommand::Spf {
+                domain: "example.com".into(),
+                ip: vec!["1.2.3.4".into()],
+                include: vec![],
+                auto_ip: false,
+                hostname: Some("mail.example.com".into()),
+                format: crate::dns::DnsFormat::Human,
+            },
+            dir.path(),
+        )
+        .unwrap();
     }
 }

@@ -1,5 +1,7 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
+
+use crate::dns::DnsFormat;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -36,6 +38,17 @@ pub enum Command {
     User(Box<UserArgs>),
     /// Manage REST API bearer tokens
     Token(Box<TokenArgs>),
+    /// Generate DKIM signing keys for a domain
+    Dkim(Box<DkimArgs>),
+    /// Print DNS records (DKIM / SPF) to publish
+    Dns(Box<DnsArgs>),
+}
+
+/// DKIM key algorithm for `dkim generate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DkimKeyAlgorithm {
+    Rsa,
+    Ed25519,
 }
 
 #[derive(Debug, Args)]
@@ -237,6 +250,82 @@ pub enum SecretSource {
     Generate,
 }
 
+// ---------------------------------------------------------------------
+// dkim
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Args)]
+pub struct DkimArgs {
+    #[command(subcommand)]
+    pub command: DkimCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DkimCommand {
+    /// Generate a new DKIM private key and print its DNS TXT record
+    Generate {
+        /// Domain to generate the key for (e.g. example.com)
+        domain: String,
+        /// DKIM selector; defaults to "mail"
+        #[arg(long, default_value = "mail")]
+        selector: String,
+        /// Key algorithm
+        #[arg(long, value_enum, default_value_t = DkimKeyAlgorithm::Rsa)]
+        algorithm: DkimKeyAlgorithm,
+        /// RSA key size in bits (ignored for ed25519)
+        #[arg(long, default_value_t = 2048)]
+        bits: u32,
+        /// Overwrite an existing key for this selector
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+// ---------------------------------------------------------------------
+// dns
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Args)]
+pub struct DnsArgs {
+    #[command(subcommand)]
+    pub command: DnsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DnsCommand {
+    /// Print the DKIM TXT record for a domain/selector
+    Dkim {
+        /// Domain the key was generated for
+        domain: String,
+        /// Selector the key was generated under; defaults to "mail"
+        #[arg(long, default_value = "mail")]
+        selector: String,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = DnsFormat::Human)]
+        format: DnsFormat,
+    },
+    /// Print the SPF TXT record for a domain
+    Spf {
+        /// Domain to authorize sending for
+        domain: String,
+        /// Authorize an explicit IPv4 or IPv6 address (repeatable)
+        #[arg(long, value_name = "IP")]
+        ip: Vec<String>,
+        /// Include another domain's SPF policy (repeatable)
+        #[arg(long, value_name = "DOMAIN")]
+        include: Vec<String>,
+        /// Attempt to auto-detect this server's public IP address
+        #[arg(long)]
+        auto_ip: bool,
+        /// Override the `a:` hostname (defaults to the config hostname)
+        #[arg(long)]
+        hostname: Option<String>,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = DnsFormat::Human)]
+        format: DnsFormat,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,6 +499,116 @@ mod tests {
                 _ => panic!("expected token remove"),
             },
             _ => panic!("expected token command"),
+        }
+    }
+
+    #[test]
+    fn parses_dkim_generate_defaults() {
+        let cli = Cli::try_parse_from(["micromail", "dkim", "generate", "example.com"]).unwrap();
+        match cli.command.unwrap() {
+            Command::Dkim(args) => match args.command {
+                DkimCommand::Generate {
+                    domain,
+                    selector,
+                    algorithm,
+                    bits,
+                    force,
+                } => {
+                    assert_eq!(domain, "example.com");
+                    assert_eq!(selector, "mail");
+                    assert_eq!(algorithm, DkimKeyAlgorithm::Rsa);
+                    assert_eq!(bits, 2048);
+                    assert!(!force);
+                }
+            },
+            _ => panic!("expected dkim command"),
+        }
+    }
+
+    #[test]
+    fn parses_dkim_generate_ed25519_force() {
+        let cli = Cli::try_parse_from([
+            "micromail",
+            "dkim",
+            "generate",
+            "example.com",
+            "--selector",
+            "sel",
+            "--algorithm",
+            "ed25519",
+            "--bits",
+            "4096",
+            "--force",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Dkim(args) => match args.command {
+                DkimCommand::Generate {
+                    selector,
+                    algorithm,
+                    bits,
+                    force,
+                    ..
+                } => {
+                    assert_eq!(selector, "sel");
+                    assert_eq!(algorithm, DkimKeyAlgorithm::Ed25519);
+                    assert_eq!(bits, 4096);
+                    assert!(force);
+                }
+            },
+            _ => panic!("expected dkim command"),
+        }
+    }
+
+    #[test]
+    fn parses_dns_subcommands() {
+        let cli = Cli::try_parse_from(["micromail", "dns", "dkim", "example.com"]).unwrap();
+        match cli.command.unwrap() {
+            Command::Dns(args) => match args.command {
+                DnsCommand::Dkim {
+                    domain,
+                    selector,
+                    ..
+                } => {
+                    assert_eq!(domain, "example.com");
+                    assert_eq!(selector, "mail");
+                }
+                _ => panic!("expected dns dkim"),
+            },
+            _ => panic!("expected dns command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "micromail",
+            "dns",
+            "spf",
+            "example.com",
+            "--ip",
+            "1.2.3.4",
+            "--include",
+            "sendgrid.net",
+            "--auto-ip",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Dns(args) => match args.command {
+                DnsCommand::Spf {
+                    domain,
+                    ip,
+                    include,
+                    auto_ip,
+                    hostname,
+                    ..
+                } => {
+                    assert_eq!(domain, "example.com");
+                    assert_eq!(ip, vec!["1.2.3.4".to_string()]);
+                    assert_eq!(include, vec!["sendgrid.net".to_string()]);
+                    assert!(auto_ip);
+                    assert!(hostname.is_none());
+                }
+                _ => panic!("expected dns spf"),
+            },
+            _ => panic!("expected dns command"),
         }
     }
 }
