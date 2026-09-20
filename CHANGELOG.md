@@ -1,3 +1,11 @@
+## 0.2.0 (2026-09-20)
+
+- Feature: DKIM key generation - `micromail dkim generate <domain>` (RSA 2048 default / Ed25519, 0600 perms, selector validation, syncs `dkim_selector_default`, prints TXT record).
+- Feature: DNS helpers - `micromail dns dkim <domain>` and `micromail dns spf <domain>` (`--ip`, `--include`, `--auto-ip`, `--hostname`, `--format human|bind`, BIND 255-byte chunking).
+- Feature: Static musl binary - `micromail-*-x86_64-musl` CI artifact and release asset for Alpine.
+- Fix: Install rustls `ring` crypto provider in delivery resolver (fixes `queue::tests` / production MX-delivery panic).
+- Fix: Gate unix-only `PermissionsExt` assertion in DKIM test for Windows CI.
+
 ## 0.1.0 (2026-08-26)
 
 - Feature: Lightweight outbound SMTP relay - a single <16 MiB binary, one TOML file, no daemons-of-daemons or databases.
