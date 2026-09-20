@@ -1305,7 +1305,6 @@ mod tests {
     fn dkim_generate_writes_loadable_key() {
         use crate::cli::{DkimCommand, DkimKeyAlgorithm};
         use crate::dkim::DkimManager;
-        use std::os::unix::fs::PermissionsExt;
 
         let dir = temp_dir();
         dkim_command(
@@ -1322,8 +1321,12 @@ mod tests {
 
         let path = dir.path().join("dkim/example.com/mail");
         assert!(path.exists(), "key not written");
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "key must be 0o600");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "key must be 0o600");
+        }
 
         // The daemon must be able to load it under the default selector.
         let manager = DkimManager::load(&dir.path().join("dkim"), "mail").unwrap();
