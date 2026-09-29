@@ -1,3 +1,7 @@
+## Unreleased
+
+- Fix: DKIM TXT record for RSA keys now publishes `p=` as a DER SubjectPublicKeyInfo (RFC 6376 section 3.6.1) instead of a bare PKCS#1 RSAPublicKey, which strict verifiers reject as an unusable key. Keys published by earlier versions can be converted by prefixing `MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A` to a 2048-bit `p=` value; the private key is unchanged.
+
 ## 0.2.0 (2026-09-20)
 
 - Feature: DKIM key generation - `micromail dkim generate <domain>` (RSA 2048 default / Ed25519, 0600 perms, selector validation, syncs `dkim_selector_default`, prints TXT record).

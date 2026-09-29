@@ -117,10 +117,10 @@ pub fn generate_key(kind: KeyKind, bits: u32) -> Result<(PrivateKey, String)> {
 pub fn public_key_dns(_domain: &str, _selector: &str, key: &PrivateKey) -> Result<String> {
     let (k, p) = match key {
         PrivateKey::Rsa(k) => {
-            use rsa::pkcs1::EncodeRsaPublicKey;
+            use rsa::pkcs8::EncodePublicKey;
             let der = k
                 .to_public_key()
-                .to_pkcs1_der()
+                .to_public_key_der()
                 .map_err(|e| Error::Dkim(format!("export RSA public key: {e}")))?;
             ("rsa", BASE64.encode(der.as_bytes()))
         }
@@ -866,6 +866,42 @@ ccRqGWFXwwPUPeTFHVTFnLE=
     fn parses_rsa_key() {
         let key = parse_key(RSA_KEY.as_bytes()).unwrap();
         assert!(matches!(key, PrivateKey::Rsa(_)));
+    }
+
+    fn dns_p_value(record: &str) -> Vec<u8> {
+        let p = record
+            .split("; ")
+            .find_map(|part| part.strip_prefix("p="))
+            .expect("record has a p= tag");
+        BASE64.decode(p).unwrap()
+    }
+
+    #[test]
+    fn rsa_dns_record_is_subject_public_key_info() {
+        use rsa::pkcs8::DecodePublicKey;
+
+        let key = parse_key(RSA_KEY.as_bytes()).unwrap();
+        let record = public_key_dns("example.com", "mail", &key).unwrap();
+        assert!(record.starts_with("v=DKIM1; k=rsa; p="));
+
+        // RFC 6376 section 3.6.1: p= is the base64 of a DER
+        // SubjectPublicKeyInfo, not a bare PKCS#1 RSAPublicKey.
+        let der = dns_p_value(&record);
+        let parsed = rsa::RsaPublicKey::from_public_key_der(&der).unwrap();
+        let PrivateKey::Rsa(private) = &key else {
+            panic!("expected an RSA key");
+        };
+        assert_eq!(parsed, private.to_public_key());
+    }
+
+    #[test]
+    fn ed25519_dns_record_is_raw_public_key() {
+        let (key, _pem) = generate_key(KeyKind::Ed25519, 0).unwrap();
+        let record = public_key_dns("example.com", "mail", &key).unwrap();
+        assert!(record.starts_with("v=DKIM1; k=ed25519; p="));
+
+        // RFC 8463 section 4: p= is the base64 of the raw 32-byte key.
+        assert_eq!(dns_p_value(&record).len(), 32);
     }
 
     #[test]
