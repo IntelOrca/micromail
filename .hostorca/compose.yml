@@ -1,0 +1,19 @@
+# Deployment for hostorca: describes the service, not the instance.
+services:
+  server:
+    build: .
+    # The instance's own values: the hostname it presents, the submission user
+    # and API token its clients use. None of them belong in this file.
+    environment:
+      MAIL_HOSTNAME: ${MAIL_HOSTNAME}
+      SMTP_USERNAME: ${SMTP_USERNAME}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+      API_TOKEN: ${API_TOKEN}
+      ALLOW_AUTH_INSECURE: ${ALLOW_AUTH_INSECURE:-false}
+    expose:
+      - 587
+      - 8080
+    volumes:
+      # The delivery spool and DKIM keys; each instance keeps its own.
+      - ./data:/data
+    restart: unless-stopped
