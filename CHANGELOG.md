@@ -1,4 +1,4 @@
-## Unreleased
+## 0.2.1 (2026-10-17)
 
 - Fix: DKIM TXT record for RSA keys now publishes `p=` as a DER SubjectPublicKeyInfo (RFC 6376 section 3.6.1) instead of a bare PKCS#1 RSAPublicKey, which strict verifiers reject as an unusable key. Keys published by earlier versions can be converted by prefixing `MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A` to a 2048-bit `p=` value; the private key is unchanged.
 
