@@ -157,15 +157,11 @@ async fn send(
         )));
     }
 
-    if !micromail::message::is_valid_email(&args.from) {
-        return Err(micromail::error::Error::InvalidInput(format!(
-            "invalid --from address {:?}",
-            args.from
-        )));
-    }
+    let (from_name, from) = micromail::message::parse_mailbox(&args.from)?;
 
     let outgoing = Outgoing {
-        from: args.from.clone(),
+        from: from.clone(),
+        from_name,
         to: args.to.clone(),
         cc: args.cc.clone(),
         bcc: args.bcc.clone(),
@@ -174,7 +170,6 @@ async fn send(
         html,
     };
     let body = micromail::message::build(&outgoing)?;
-    let from = args.from.trim().to_lowercase();
 
     delivery.deliver(&from, &recipients, &body).await?;
     println!(

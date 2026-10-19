@@ -178,6 +178,7 @@ async fn build_and_enqueue(state: &AppState, req: &SendRequest) -> Result<String
 
     let outgoing = crate::message::Outgoing {
         from: req.from.clone(),
+        from_name: None,
         to: req.to.clone(),
         cc: req.cc.clone(),
         bcc: req.bcc.clone(),

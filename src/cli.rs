@@ -53,7 +53,7 @@ pub enum DkimKeyAlgorithm {
 
 #[derive(Debug, Args)]
 pub struct SendArgs {
-    /// Envelope sender address
+    /// Sender address, optionally with a display name ("Jane Doe <jane@example.com>")
     #[arg(long)]
     pub from: String,
 

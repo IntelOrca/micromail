@@ -6,6 +6,9 @@ use mail_builder::MessageBuilder;
 #[derive(Debug, Clone, Default)]
 pub struct Outgoing {
     pub from: String,
+    /// Display name for the From header. The address alone is used for the
+    /// SMTP envelope and DKIM signing.
+    pub from_name: Option<String>,
     pub to: Vec<String>,
     pub cc: Vec<String>,
     pub bcc: Vec<String>,
@@ -17,7 +20,11 @@ pub struct Outgoing {
 /// Build the raw RFC 5322 message. `bcc` recipients are delivered via the
 /// SMTP envelope only and never appear in the message headers.
 pub fn build(out: &Outgoing) -> Result<Vec<u8>> {
-    let mut builder = MessageBuilder::new().from(out.from.trim());
+    let from = out.from.trim();
+    let mut builder = match out.from_name.as_deref() {
+        Some(name) if !name.is_empty() => MessageBuilder::new().from((name, from)),
+        _ => MessageBuilder::new().from(from),
+    };
     if let Some(subject) = &out.subject {
         builder = builder.subject(subject);
     }
@@ -63,6 +70,46 @@ pub fn is_valid_email(addr: &str) -> bool {
     !local.is_empty() && !domain.is_empty() && !domain.starts_with('.') && !domain.ends_with('.')
 }
 
+/// Split a mailbox into an optional display name and the bare address.
+/// Accepts `addr@example.com` or `Display Name <addr@example.com>`: the name
+/// (which may be quoted) goes in the From header, while the address —
+/// lowercased — is used for the SMTP envelope and DKIM signing.
+pub fn parse_mailbox(input: &str) -> Result<(Option<String>, String)> {
+    let input = input.trim();
+    let invalid = || {
+        Error::InvalidInput(format!(
+            "invalid address {input:?}: expected addr@example.com or Display Name <addr@example.com>"
+        ))
+    };
+
+    let (name, addr) = match (input.rfind('<'), input.rfind('>')) {
+        (Some(open), Some(close)) if open < close && close == input.len() - 1 => {
+            let name = input[..open].trim();
+            let name = name
+                .strip_prefix('"')
+                .and_then(|name| name.strip_suffix('"'))
+                .unwrap_or(name);
+            if name.contains('<') || name.contains('>') {
+                return Err(invalid());
+            }
+            (Some(name), input[open + 1..close].trim())
+        }
+        (None, None) => (None, input),
+        _ => return Err(invalid()),
+    };
+
+    if let Some(name) = name {
+        if name.chars().any(char::is_control) {
+            return Err(invalid());
+        }
+    }
+    if !is_valid_email(addr) {
+        return Err(invalid());
+    }
+    let name = name.filter(|name| !name.is_empty()).map(str::to_string);
+    Ok((name, addr.to_lowercase()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,6 +134,7 @@ mod tests {
     fn builds_without_bcc_header() {
         let out = Outgoing {
             from: "a@b.com".into(),
+            from_name: None,
             to: vec!["c@d.com".into()],
             cc: vec![],
             bcc: vec!["e@f.com".into()],
@@ -106,6 +154,7 @@ mod tests {
     fn builds_multipart_when_html_present() {
         let out = Outgoing {
             from: "a@b.com".into(),
+            from_name: None,
             to: vec!["c@d.com".into()],
             cc: vec![],
             bcc: vec![],
@@ -117,5 +166,52 @@ mod tests {
         let text = String::from_utf8(body).unwrap();
         assert!(text.contains("multipart/alternative"));
         assert!(text.contains("<p>rich</p>"));
+    }
+
+    #[test]
+    fn parses_mailboxes() {
+        let (name, addr) = parse_mailbox("user@example.com").unwrap();
+        assert_eq!(name, None);
+        assert_eq!(addr, "user@example.com");
+
+        let (name, addr) = parse_mailbox("Jane Doe <Jane@Example.com>").unwrap();
+        assert_eq!(name.as_deref(), Some("Jane Doe"));
+        assert_eq!(addr, "jane@example.com");
+
+        let (name, addr) = parse_mailbox("\"Jane Doe\" <jane@example.com>").unwrap();
+        assert_eq!(name.as_deref(), Some("Jane Doe"));
+        assert_eq!(addr, "jane@example.com");
+
+        let (name, addr) = parse_mailbox("<jane@example.com>").unwrap();
+        assert_eq!(name, None);
+        assert_eq!(addr, "jane@example.com");
+    }
+
+    #[test]
+    fn rejects_malformed_mailboxes() {
+        assert!(parse_mailbox("Jane Doe").is_err());
+        assert!(parse_mailbox("Jane Doe <jane@example.com").is_err());
+        assert!(parse_mailbox("Jane Doe <jane@example.com> extra").is_err());
+        assert!(parse_mailbox("A <B> <jane@example.com>").is_err());
+        assert!(parse_mailbox("Jane\nDoe <jane@example.com>").is_err());
+        assert!(parse_mailbox("Jane Doe <jane@>").is_err());
+    }
+
+    #[test]
+    fn builds_from_header_with_display_name() {
+        let out = Outgoing {
+            from: "no-reply@example.com".into(),
+            from_name: Some("hostorca".into()),
+            to: vec!["c@d.com".into()],
+            cc: vec![],
+            bcc: vec![],
+            subject: Some("Hello".into()),
+            text: Some("body".into()),
+            html: None,
+        };
+        let body = build(&out).unwrap();
+        let text = String::from_utf8(body).unwrap();
+        // mail-builder always quotes display names.
+        assert!(text.contains("From: \"hostorca\" <no-reply@example.com>"));
     }
 }

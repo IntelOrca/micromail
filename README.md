@@ -88,6 +88,7 @@ micromail send \
 ```
 
 Also available: `--cc`, `--bcc`, `--html`, `--text-file`, `--html-file` (repeatable recipients).
+`--from` also accepts a display name: `--from 'Jane Doe <jane@example.com>'`.
 
 ### 2. SMTP
 
