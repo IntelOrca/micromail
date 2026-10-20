@@ -17,7 +17,8 @@ pub fn default_config_dir() -> PathBuf {
 pub struct Config {
     /// Log level (trace, debug, info, warn, error).
     pub log: String,
-    /// Hostname used in the SMTP greeting and EHLO response.
+    /// Hostname used in the SMTP greeting and EHLO, for both the server and
+    /// outbound delivery.
     pub hostname: String,
     /// Maximum size in bytes of a single message accepted by the SMTP server.
     pub max_message_size: usize,

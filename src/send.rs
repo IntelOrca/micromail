@@ -48,6 +48,8 @@ pub struct Delivery {
     dkim: Arc<DkimManager>,
     relay: Option<Relay>,
     timeout: Duration,
+    /// Hostname announced in the outbound SMTP EHLO.
+    hostname: String,
     /// Shared DNS resolver (re-reads resolv.conf only once, at construction).
     resolver: hickory_resolver::TokioResolver,
 }
@@ -108,6 +110,7 @@ impl Delivery {
             dkim,
             relay,
             timeout: Duration::from_secs(config.delivery.timeout_secs.max(1)),
+            hostname: config.hostname.clone(),
             resolver,
         })
     }
@@ -129,6 +132,7 @@ impl Delivery {
                 password: None,
             }),
             timeout: Duration::from_secs(1),
+            hostname: "localhost".into(),
             resolver: build_resolver().expect("test resolver"),
         }
     }
@@ -343,44 +347,61 @@ impl Delivery {
         tracing::debug!(host = %host, port, tls = ?tls, "connecting to SMTP server");
         match tls {
             TlsMode::Plain => {
-                let client = make_builder(host, port, self.timeout, username, password)?
-                    .connect_plain()
-                    .await?;
+                let client =
+                    make_builder(host, port, self.timeout, username, password, &self.hostname)?
+                        .connect_plain()
+                        .await?;
                 Ok(box_client(client))
             }
             TlsMode::Tls => {
-                let client = make_builder(host, port, self.timeout, username, password)?
-                    .implicit_tls(true)
-                    .connect()
-                    .await?;
+                let client =
+                    make_builder(host, port, self.timeout, username, password, &self.hostname)?
+                        .implicit_tls(true)
+                        .connect()
+                        .await?;
                 Ok(box_client(client))
             }
             TlsMode::Starttls => {
-                let client = make_builder(host, port, self.timeout, username, password)?
-                    .implicit_tls(false)
-                    .connect()
-                    .await?;
+                let client =
+                    make_builder(host, port, self.timeout, username, password, &self.hostname)?
+                        .implicit_tls(false)
+                        .connect()
+                        .await?;
                 Ok(box_client(client))
             }
             TlsMode::Auto => {
                 if port == 465 {
-                    let client = make_builder(host, port, self.timeout, username, password)?
-                        .implicit_tls(true)
-                        .connect()
-                        .await?;
+                    let client =
+                        make_builder(host, port, self.timeout, username, password, &self.hostname)?
+                            .implicit_tls(true)
+                            .connect()
+                            .await?;
                     Ok(box_client(client))
                 } else {
-                    match make_builder(host, port, self.timeout, username, password)?
-                        .implicit_tls(false)
-                        .connect()
-                        .await
+                    match make_builder(
+                        host,
+                        port,
+                        self.timeout,
+                        username,
+                        password,
+                        &self.hostname,
+                    )?
+                    .implicit_tls(false)
+                    .connect()
+                    .await
                     {
                         Ok(client) => Ok(box_client(client)),
                         Err(mail_send::Error::MissingStartTls) => {
-                            let client =
-                                make_builder(host, port, self.timeout, username, password)?
-                                    .connect_plain()
-                                    .await?;
+                            let client = make_builder(
+                                host,
+                                port,
+                                self.timeout,
+                                username,
+                                password,
+                                &self.hostname,
+                            )?
+                            .connect_plain()
+                            .await?;
                             Ok(box_client(client))
                         }
                         Err(e) => Err(e.into()),
@@ -433,10 +454,12 @@ fn make_builder<'a>(
     timeout: Duration,
     username: Option<&'a str>,
     password: Option<&'a str>,
+    helo_host: &str,
 ) -> Result<SmtpClientBuilder<&'a str>> {
     let mut builder = SmtpClientBuilder::new(host, port)
         .map_err(Error::Send)?
-        .timeout(timeout);
+        .timeout(timeout)
+        .helo_host(helo_host);
     if let (Some(u), Some(p)) = (username, password) {
         builder = builder.credentials(Credentials::Plain {
             username: u,
@@ -550,5 +573,80 @@ mod tests {
         let from_pos = s.find("From:").unwrap();
         let body_pos = s.find("\r\n\r\n").unwrap();
         assert!(dkim_pos > from_pos && dkim_pos < body_pos);
+    }
+
+    #[tokio::test]
+    async fn outbound_ehlo_uses_configured_hostname() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            stream.write_all(b"220 test ESMTP\r\n").unwrap();
+            let mut ehlo = String::new();
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                let command = line.trim_end();
+                if command.starts_with("EHLO ") {
+                    ehlo = command.to_string();
+                    stream.write_all(b"250-test\r\n250 OK\r\n").unwrap();
+                } else if command == "DATA" {
+                    stream
+                        .write_all(b"354 End data with <CR><LF>.<CR><LF>\r\n")
+                        .unwrap();
+                    loop {
+                        let mut data = String::new();
+                        match reader.read_line(&mut data) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                        if data.trim_end() == "." {
+                            break;
+                        }
+                    }
+                    stream.write_all(b"250 OK queued\r\n").unwrap();
+                } else if command == "QUIT" {
+                    stream.write_all(b"221 Bye\r\n").unwrap();
+                    break;
+                } else {
+                    stream.write_all(b"250 OK\r\n").unwrap();
+                }
+            }
+            ehlo
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::Config {
+            hostname: "helo.example".into(),
+            delivery: crate::config::DeliveryConfig {
+                relay: Some(format!("127.0.0.1:{port}")),
+                relay_tls: "plain".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let delivery = Delivery::from_config(&config, dir.path()).unwrap();
+        delivery
+            .deliver(
+                "sender@example.com",
+                &["rcpt@example.com".to_string()],
+                b"From: sender@example.com\r\nTo: rcpt@example.com\r\nSubject: test\r\n\r\nbody\r\n",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(server.join().unwrap(), "EHLO helo.example");
     }
 }

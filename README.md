@@ -129,7 +129,7 @@ points at exactly one directory instead.
 
 | Key | Default | Description |
 |---|---|---|
-| `hostname` | — | Name presented in EHLO and message headers |
+| `hostname` | — | Name presented in the SMTP greeting and EHLO (inbound and outbound) and in message headers |
 | `log` | `"info"` | `trace`, `debug`, `info`, `warn`, `error` |
 | `max_message_size` | `26214400` | Max accepted message size in bytes (25 MiB) |
 | `max_recipients` | `100` | Max recipients per envelope |
